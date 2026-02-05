@@ -96,6 +96,7 @@ The supported providers. The options are:
 - Ogmios node instance along with Kupo
 - Maestro blockchain API, provided its API token.
 - Blockfrost API, provided its API key.
+- Custom Blockfrost instance (e.g., self-hosted), with optional API key.
 
 In JSON format, this essentially corresponds to:
 
@@ -103,6 +104,7 @@ In JSON format, this essentially corresponds to:
 | { ogmiosUrl: string, kupoUrl: string, mempoolCache: { cacheInterval: number }, localTxSubmissionCache: { cacheInterval: number } }
 | { maestroToken: string, turboSubmit: boolean }
 | { blockfrostKey: string }
+| { blockfrostUrl: string, maybeBlockfrostKey?: string }
 
 The constructor tags don't need to appear in the JSON.
 -}
@@ -111,6 +113,7 @@ data GYCoreProviderInfo
   | GYOgmiosKupo {cpiOgmiosUrl :: !Text, cpiKupoUrl :: !Text, cpiMempoolCache :: !(Maybe MempoolCacheSettings), cpiLocalTxSubmissionCache :: !(Maybe LocalTxSubmissionCacheSettings)}
   | GYMaestro {cpiMaestroToken :: !(Confidential Text), cpiTurboSubmit :: !(Maybe Bool)}
   | GYBlockfrost {cpiBlockfrostKey :: !(Confidential Text)}
+  | GYBlockfrostCustom {cpiBlockfrostUrl :: !Text, cpiMaybeBlockfrostKey :: !(Maybe (Confidential Text))}
   deriving stock Show
 
 $( deriveFromJSON
@@ -138,6 +141,7 @@ isMaestro _ = False
 
 isBlockfrost :: GYCoreProviderInfo -> Bool
 isBlockfrost GYBlockfrost {} = True
+isBlockfrost GYBlockfrostCustom {} = True
 isBlockfrost _ = False
 
 findMaestroTokenAndNetId :: [GYCoreConfig] -> IO (Text, GYNetworkId)
@@ -291,6 +295,31 @@ withCfgProviders
             )
         GYBlockfrost (Confidential key) -> do
           let proj = Blockfrost.networkIdToProject cfgNetworkId key
+          blockfrostSlotActions <- makeSlotActions slotCachingTime $ Blockfrost.blockfrostGetSlotOfCurrentBlock proj
+          blockfrostGetParams <-
+            makeGetParameters
+              (Blockfrost.blockfrostProtocolParams proj)
+              (Blockfrost.blockfrostSystemStart proj)
+              (Blockfrost.blockfrostEraHistory proj)
+              (Blockfrost.blockfrostGetSlotOfCurrentBlock proj)
+          pure
+            ( blockfrostGetParams
+            , blockfrostSlotActions
+            , Blockfrost.blockfrostQueryUtxo proj
+            , Blockfrost.blockfrostLookupDatum proj
+            , Blockfrost.blockfrostSubmitTx proj
+            , Blockfrost.blockfrostAwaitTxConfirmed proj
+            , Blockfrost.blockfrostStakeAddressInfo proj
+            , Blockfrost.blockfrostDRepState proj
+            , Blockfrost.blockfrostDRepsState proj
+            , Blockfrost.blockfrostStakePools proj
+            , Blockfrost.blockfrostConstitution proj
+            , Blockfrost.blockfrostProposals proj
+            , Blockfrost.blockfrostMempoolTxs proj
+            )
+        GYBlockfrostCustom url mkey -> do
+          let key = maybe "" id $ coerce mkey
+              proj = Blockfrost.networkIdToProjectCustom url key
           blockfrostSlotActions <- makeSlotActions slotCachingTime $ Blockfrost.blockfrostGetSlotOfCurrentBlock proj
           blockfrostGetParams <-
             makeGetParameters
