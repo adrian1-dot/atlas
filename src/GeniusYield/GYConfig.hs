@@ -19,6 +19,7 @@ module GeniusYield.GYConfig (
   isOgmiosKupo,
   isMaestro,
   isBlockfrost,
+  isUtxoRpc,
 ) where
 
 import Control.Exception (SomeException, bracket, try)
@@ -49,6 +50,7 @@ import GeniusYield.Providers.Maestro qualified as MaestroApi
 import GeniusYield.Providers.Node (nodeGetDRepState, nodeGetDRepsState, nodeStakeAddressInfo)
 import GeniusYield.Providers.Node qualified as Node
 import GeniusYield.Providers.Ogmios qualified as OgmiosApi
+import GeniusYield.Providers.UtxoRpc qualified as UtxoRpcApi
 import GeniusYield.ReadJSON (readJSON)
 import GeniusYield.Types
 
@@ -114,6 +116,7 @@ data GYCoreProviderInfo
   | GYMaestro {cpiMaestroToken :: !(Confidential Text), cpiTurboSubmit :: !(Maybe Bool)}
   | GYBlockfrost {cpiBlockfrostKey :: !(Confidential Text)}
   | GYBlockfrostCustom {cpiBlockfrostUrl :: !Text, cpiMaybeBlockfrostKey :: !(Maybe (Confidential Text))}
+  | GYUtxoRpc {cpiUtxoRpcHost :: !Text, cpiUtxoRpcPort :: !Int, cpiUtxoRpcUseTls :: !Bool}
   deriving stock Show
 
 $( deriveFromJSON
@@ -143,6 +146,10 @@ isBlockfrost :: GYCoreProviderInfo -> Bool
 isBlockfrost GYBlockfrost {} = True
 isBlockfrost GYBlockfrostCustom {} = True
 isBlockfrost _ = False
+
+isUtxoRpc :: GYCoreProviderInfo -> Bool
+isUtxoRpc GYUtxoRpc {} = True
+isUtxoRpc _ = False
 
 findMaestroTokenAndNetId :: [GYCoreConfig] -> IO (Text, GYNetworkId)
 findMaestroTokenAndNetId configs = do
@@ -202,147 +209,317 @@ withCfgProviders
     }
   ns
   f =
-    do
-      (gyGetParameters, gySlotActions', gyQueryUTxO', gyLookupDatum, gySubmitTx, gyAwaitTxConfirmed, gyGetStakeAddressInfo, gyGetDRepState, gyGetDRepsState, gyGetStakePools, gyGetConstitution, gyGetProposals, gyGetMempoolTxs) <- case cfgCoreProvider of
-        GYNodeKupo path kupoUrl mmempoolCache mlocalTxSubCache -> do
-          let info = nodeConnectInfo path cfgNetworkId
-          kEnv <- KupoApi.newKupoApiEnv $ Text.unpack kupoUrl
-          nodeSlotActions <- makeSlotActions slotCachingTime $ Node.nodeGetSlotOfCurrentBlock info
-          nodeGetParams <- Node.nodeGetParameters info
-          queryUtxo <- case mmempoolCache of
-            Nothing -> pure $ KupoApi.kupoQueryUtxo kEnv
-            Just (MempoolCacheSettings cacheInterval) -> do
-              augmentQueryUTxOWithMempool (KupoApi.kupoQueryUtxo kEnv) (Node.nodeMempoolTxs info) cacheInterval
-          (queryUtxo', submitTx) <- case mlocalTxSubCache of
-            Nothing -> pure (queryUtxo, Node.nodeSubmitTx info)
-            Just (LocalTxSubmissionCacheSettings cacheInterval) -> do
-              locallySubmittedTxsVar <- mkLocallySubmittedTxsVar cacheInterval
-              let augmentedSubmitTx = augmentTxSubmission (Node.nodeSubmitTx info) locallySubmittedTxsVar
-              pure (augmentQueryUTxOWithLocalSubmission queryUtxo locallySubmittedTxsVar, augmentedSubmitTx)
-          pure
-            ( nodeGetParams
-            , nodeSlotActions
-            , queryUtxo'
-            , KupoApi.kupoLookupDatum kEnv
-            , submitTx
-            , KupoApi.kupoAwaitTxConfirmed kEnv
-            , nodeStakeAddressInfo info
-            , nodeGetDRepState info
-            , nodeGetDRepsState info
-            , Node.nodeStakePools info
-            , Node.nodeConstitution info
-            , Node.nodeProposals info
-            , Node.nodeMempoolTxs info
-            )
-        GYOgmiosKupo ogmiosUrl kupoUrl mmempoolCache mlocalTxSubCache -> do
-          oEnv <- OgmiosApi.newOgmiosApiEnv $ Text.unpack ogmiosUrl
-          kEnv <- KupoApi.newKupoApiEnv $ Text.unpack kupoUrl
-          ogmiosSlotActions <- makeSlotActions slotCachingTime $ OgmiosApi.ogmiosGetSlotOfCurrentBlock oEnv
-          ogmiosGetParams <-
-            makeGetParameters
-              (OgmiosApi.ogmiosProtocolParameters oEnv)
-              (OgmiosApi.ogmiosStartTime oEnv)
-              (OgmiosApi.ogmiosEraSummaries oEnv)
-              (OgmiosApi.ogmiosGetSlotOfCurrentBlock oEnv)
-          queryUtxo <- case mmempoolCache of
-            Nothing -> pure $ KupoApi.kupoQueryUtxo kEnv
-            Just (MempoolCacheSettings cacheInterval) -> do
-              augmentQueryUTxOWithMempool (KupoApi.kupoQueryUtxo kEnv) (OgmiosApi.ogmiosMempoolTxsWs oEnv) cacheInterval
-          (queryUtxo', submitTx) <- case mlocalTxSubCache of
-            Nothing -> pure (queryUtxo, OgmiosApi.ogmiosSubmitTx oEnv)
-            Just (LocalTxSubmissionCacheSettings cacheInterval) -> do
-              locallySubmittedTxsVar <- mkLocallySubmittedTxsVar cacheInterval
-              let augmentedSubmitTx = augmentTxSubmission (OgmiosApi.ogmiosSubmitTx oEnv) locallySubmittedTxsVar
-              pure (augmentQueryUTxOWithLocalSubmission queryUtxo locallySubmittedTxsVar, augmentedSubmitTx)
-          pure
-            ( ogmiosGetParams
-            , ogmiosSlotActions
-            , queryUtxo'
-            , KupoApi.kupoLookupDatum kEnv
-            , submitTx
-            , KupoApi.kupoAwaitTxConfirmed kEnv
-            , OgmiosApi.ogmiosStakeAddressInfo oEnv
-            , OgmiosApi.ogmiosGetDRepState oEnv
-            , OgmiosApi.ogmiosGetDRepsState oEnv
-            , OgmiosApi.ogmiosStakePools oEnv
-            , OgmiosApi.ogmiosConstitution oEnv
-            , OgmiosApi.ogmiosProposals oEnv
-            , OgmiosApi.ogmiosMempoolTxsWs oEnv
-            )
-        GYMaestro (Confidential apiToken) turboSubmit -> do
-          maestroApiEnv <- MaestroApi.networkIdToMaestroEnv apiToken cfgNetworkId
-          maestroSlotActions <- makeSlotActions slotCachingTime $ MaestroApi.maestroGetSlotOfCurrentBlock maestroApiEnv
-          maestroGetParams <-
-            makeGetParameters
-              (MaestroApi.maestroProtocolParams maestroApiEnv)
-              (MaestroApi.maestroSystemStart maestroApiEnv)
-              (MaestroApi.maestroEraHistory maestroApiEnv)
-              (MaestroApi.maestroGetSlotOfCurrentBlock maestroApiEnv)
-          pure
-            ( maestroGetParams
-            , maestroSlotActions
-            , MaestroApi.maestroQueryUtxo maestroApiEnv
-            , MaestroApi.maestroLookupDatum maestroApiEnv
-            , MaestroApi.maestroSubmitTx (Just True == turboSubmit) maestroApiEnv
-            , MaestroApi.maestroAwaitTxConfirmed maestroApiEnv
-            , MaestroApi.maestroStakeAddressInfo maestroApiEnv
-            , MaestroApi.maestroDRepState maestroApiEnv
-            , MaestroApi.maestroDRepsState maestroApiEnv
-            , MaestroApi.maestroStakePools maestroApiEnv
-            , MaestroApi.maestroConstitution maestroApiEnv
-            , MaestroApi.maestroProposals maestroApiEnv
-            , MaestroApi.maestroMempoolTxs maestroApiEnv
-            )
-        GYBlockfrost (Confidential key) -> do
-          let proj = Blockfrost.networkIdToProject cfgNetworkId key
-          blockfrostSlotActions <- makeSlotActions slotCachingTime $ Blockfrost.blockfrostGetSlotOfCurrentBlock proj
-          blockfrostGetParams <-
-            makeGetParameters
-              (Blockfrost.blockfrostProtocolParams proj)
-              (Blockfrost.blockfrostSystemStart proj)
-              (Blockfrost.blockfrostEraHistory proj)
-              (Blockfrost.blockfrostGetSlotOfCurrentBlock proj)
-          pure
-            ( blockfrostGetParams
-            , blockfrostSlotActions
-            , Blockfrost.blockfrostQueryUtxo proj
-            , Blockfrost.blockfrostLookupDatum proj
-            , Blockfrost.blockfrostSubmitTx proj
-            , Blockfrost.blockfrostAwaitTxConfirmed proj
-            , Blockfrost.blockfrostStakeAddressInfo proj
-            , Blockfrost.blockfrostDRepState proj
-            , Blockfrost.blockfrostDRepsState proj
-            , Blockfrost.blockfrostStakePools proj
-            , Blockfrost.blockfrostConstitution proj
-            , Blockfrost.blockfrostProposals proj
-            , Blockfrost.blockfrostMempoolTxs proj
-            )
-        GYBlockfrostCustom url mkey -> do
-          let key = maybe "" id $ coerce mkey
-              proj = Blockfrost.networkIdToProjectCustom url key
-          blockfrostSlotActions <- makeSlotActions slotCachingTime $ Blockfrost.blockfrostGetSlotOfCurrentBlock proj
-          blockfrostGetParams <-
-            makeGetParameters
-              (Blockfrost.blockfrostProtocolParams proj)
-              (Blockfrost.blockfrostSystemStart proj)
-              (Blockfrost.blockfrostEraHistory proj)
-              (Blockfrost.blockfrostGetSlotOfCurrentBlock proj)
-          pure
-            ( blockfrostGetParams
-            , blockfrostSlotActions
-            , Blockfrost.blockfrostQueryUtxo proj
-            , Blockfrost.blockfrostLookupDatum proj
-            , Blockfrost.blockfrostSubmitTx proj
-            , Blockfrost.blockfrostAwaitTxConfirmed proj
-            , Blockfrost.blockfrostStakeAddressInfo proj
-            , Blockfrost.blockfrostDRepState proj
-            , Blockfrost.blockfrostDRepsState proj
-            , Blockfrost.blockfrostStakePools proj
-            , Blockfrost.blockfrostConstitution proj
-            , Blockfrost.blockfrostProposals proj
-            , Blockfrost.blockfrostMempoolTxs proj
-            )
+    case cfgCoreProvider of
+      GYNodeKupo path kupoUrl mmempoolCache mlocalTxSubCache -> do
+        -- YOUR EXISTING GYNodeKupo BRANCH, UNCHANGED
+        (gyGetParameters, gySlotActions', gyQueryUTxO', gyLookupDatum, gySubmitTxConfirmed, gyAwaitTxConfirmed, gyGetStakeAddressInfo, gyGetDRepState, gyGetDRepsState, gyGetStakePools, gyGetConstitution, gyGetProposals, gyGetMempoolTxs) <-
+          do
+            let info = nodeConnectInfo path cfgNetworkId
+            kEnv <- KupoApi.newKupoApiEnv $ Text.unpack kupoUrl
 
+            nodeSlotActions <-
+              makeSlotActions
+                slotCachingTime
+                (Node.nodeGetSlotOfCurrentBlock info)
+
+            nodeGetParams <-
+              Node.nodeGetParameters info
+
+            queryUtxo <- case mmempoolCache of
+              Nothing ->
+                pure $ KupoApi.kupoQueryUtxo kEnv
+              Just (MempoolCacheSettings cacheInterval) ->
+                augmentQueryUTxOWithMempool
+                  (KupoApi.kupoQueryUtxo kEnv)
+                  (Node.nodeMempoolTxs info)
+                  cacheInterval
+
+            (queryUtxo', submitTx) <- case mlocalTxSubCache of
+              Nothing ->
+                pure
+                  ( queryUtxo
+                  , Node.nodeSubmitTx info
+                  )
+              Just (LocalTxSubmissionCacheSettings cacheInterval) -> do
+                locallySubmittedTxsVar <-
+                  mkLocallySubmittedTxsVar cacheInterval
+
+                let augmentedSubmitTx =
+                      augmentTxSubmission
+                        (Node.nodeSubmitTx info)
+                        locallySubmittedTxsVar
+
+                pure
+                  ( augmentQueryUTxOWithLocalSubmission
+                      queryUtxo
+                      locallySubmittedTxsVar
+                  , augmentedSubmitTx
+                  )
+
+            pure
+              ( nodeGetParams
+              , nodeSlotActions
+              , queryUtxo'
+              , KupoApi.kupoLookupDatum kEnv
+              , submitTx
+              , KupoApi.kupoAwaitTxConfirmed kEnv
+              , nodeStakeAddressInfo info
+              , nodeGetDRepState info
+              , nodeGetDRepsState info
+              , Node.nodeStakePools info
+              , Node.nodeConstitution info
+              , Node.nodeProposals info
+              , Node.nodeMempoolTxs info
+              )
+
+        runProviders
+          gyGetParameters
+          gySlotActions'
+          gyQueryUTxO'
+          gyLookupDatum
+          gySubmitTxConfirmed
+          gyAwaitTxConfirmed
+          gyGetStakeAddressInfo
+          gyGetDRepState
+          gyGetDRepsState
+          gyGetStakePools
+          gyGetConstitution
+          gyGetProposals
+          gyGetMempoolTxs
+
+      GYOgmiosKupo ogmiosUrl kupoUrl mmempoolCache mlocalTxSubCache -> do
+        -- YOUR EXISTING GYOgmiosKupo BRANCH, UNCHANGED
+        (gyGetParameters, gySlotActions', gyQueryUTxO', gyLookupDatum, gySubmitTxConfirmed, gyAwaitTxConfirmed, gyGetStakeAddressInfo, gyGetDRepState, gyGetDRepsState, gyGetStakePools, gyGetConstitution, gyGetProposals, gyGetMempoolTxs) <-
+          do
+            oEnv <- OgmiosApi.newOgmiosApiEnv $ Text.unpack ogmiosUrl
+            kEnv <- KupoApi.newKupoApiEnv $ Text.unpack kupoUrl
+            ogmiosSlotActions <- makeSlotActions slotCachingTime $ OgmiosApi.ogmiosGetSlotOfCurrentBlock oEnv
+            ogmiosGetParams <-
+              makeGetParameters
+                (OgmiosApi.ogmiosProtocolParameters oEnv)
+                (OgmiosApi.ogmiosStartTime oEnv)
+                (OgmiosApi.ogmiosEraSummaries oEnv)
+                (OgmiosApi.ogmiosGetSlotOfCurrentBlock oEnv)
+            queryUtxo <- case mmempoolCache of
+              Nothing -> pure $ KupoApi.kupoQueryUtxo kEnv
+              Just (MempoolCacheSettings cacheInterval) -> do
+                augmentQueryUTxOWithMempool (KupoApi.kupoQueryUtxo kEnv) (OgmiosApi.ogmiosMempoolTxsWs oEnv) cacheInterval
+            (queryUtxo', submitTx) <- case mlocalTxSubCache of
+              Nothing -> pure (queryUtxo, OgmiosApi.ogmiosSubmitTx oEnv)
+              Just (LocalTxSubmissionCacheSettings cacheInterval) -> do
+                locallySubmittedTxsVar <- mkLocallySubmittedTxsVar cacheInterval
+                let augmentedSubmitTx = augmentTxSubmission (OgmiosApi.ogmiosSubmitTx oEnv) locallySubmittedTxsVar
+                pure (augmentQueryUTxOWithLocalSubmission queryUtxo locallySubmittedTxsVar, augmentedSubmitTx)
+            pure
+              ( ogmiosGetParams
+              , ogmiosSlotActions
+              , queryUtxo'
+              , KupoApi.kupoLookupDatum kEnv
+              , submitTx
+              , KupoApi.kupoAwaitTxConfirmed kEnv
+              , OgmiosApi.ogmiosStakeAddressInfo oEnv
+              , OgmiosApi.ogmiosGetDRepState oEnv
+              , OgmiosApi.ogmiosGetDRepsState oEnv
+              , OgmiosApi.ogmiosStakePools oEnv
+              , OgmiosApi.ogmiosConstitution oEnv
+              , OgmiosApi.ogmiosProposals oEnv
+              , OgmiosApi.ogmiosMempoolTxsWs oEnv
+              )
+        runProviders
+          gyGetParameters
+          gySlotActions'
+          gyQueryUTxO'
+          gyLookupDatum
+          gySubmitTxConfirmed
+          gyAwaitTxConfirmed
+          gyGetStakeAddressInfo
+          gyGetDRepState
+          gyGetDRepsState
+          gyGetStakePools
+          gyGetConstitution
+          gyGetProposals
+          gyGetMempoolTxs
+
+      GYMaestro (Confidential apiToken) turboSubmit -> do
+        -- YOUR EXISTING GYMaestro BRANCH, UNCHANGED
+        (gyGetParameters, gySlotActions', gyQueryUTxO', gyLookupDatum, gySubmitTxConfirmed, gyAwaitTxConfirmed, gyGetStakeAddressInfo, gyGetDRepState, gyGetDRepsState, gyGetStakePools, gyGetConstitution, gyGetProposals, gyGetMempoolTxs) <-
+          do
+            maestroApiEnv <- MaestroApi.networkIdToMaestroEnv apiToken cfgNetworkId
+            maestroSlotActions <- makeSlotActions slotCachingTime $ MaestroApi.maestroGetSlotOfCurrentBlock maestroApiEnv
+            maestroGetParams <-
+              makeGetParameters
+                (MaestroApi.maestroProtocolParams maestroApiEnv)
+                (MaestroApi.maestroSystemStart maestroApiEnv)
+                (MaestroApi.maestroEraHistory maestroApiEnv)
+                (MaestroApi.maestroGetSlotOfCurrentBlock maestroApiEnv)
+            pure
+              ( maestroGetParams
+              , maestroSlotActions
+              , MaestroApi.maestroQueryUtxo maestroApiEnv
+              , MaestroApi.maestroLookupDatum maestroApiEnv
+              , MaestroApi.maestroSubmitTx (Just True == turboSubmit) maestroApiEnv
+              , MaestroApi.maestroAwaitTxConfirmed maestroApiEnv
+              , MaestroApi.maestroStakeAddressInfo maestroApiEnv
+              , MaestroApi.maestroDRepState maestroApiEnv
+              , MaestroApi.maestroDRepsState maestroApiEnv
+              , MaestroApi.maestroStakePools maestroApiEnv
+              , MaestroApi.maestroConstitution maestroApiEnv
+              , MaestroApi.maestroProposals maestroApiEnv
+              , MaestroApi.maestroMempoolTxs maestroApiEnv
+              )
+        runProviders
+          gyGetParameters
+          gySlotActions'
+          gyQueryUTxO'
+          gyLookupDatum
+          gySubmitTxConfirmed
+          gyAwaitTxConfirmed
+          gyGetStakeAddressInfo
+          gyGetDRepState
+          gyGetDRepsState
+          gyGetStakePools
+          gyGetConstitution
+          gyGetProposals
+          gyGetMempoolTxs
+
+      GYBlockfrost (Confidential key) -> do
+        -- YOUR EXISTING GYBlockfrost BRANCH, UNCHANGED
+        (gyGetParameters, gySlotActions', gyQueryUTxO', gyLookupDatum, gySubmitTxConfirmed, gyAwaitTxConfirmed, gyGetStakeAddressInfo, gyGetDRepState, gyGetDRepsState, gyGetStakePools, gyGetConstitution, gyGetProposals, gyGetMempoolTxs) <-
+            do
+            let proj = Blockfrost.networkIdToProject cfgNetworkId key
+            blockfrostSlotActions <- makeSlotActions slotCachingTime $ Blockfrost.blockfrostGetSlotOfCurrentBlock proj
+            blockfrostGetParams <-
+              makeGetParameters
+                (Blockfrost.blockfrostProtocolParams proj)
+                (Blockfrost.blockfrostSystemStart proj)
+                (Blockfrost.blockfrostEraHistory proj)
+                (Blockfrost.blockfrostGetSlotOfCurrentBlock proj)
+            pure
+              ( blockfrostGetParams
+              , blockfrostSlotActions
+              , Blockfrost.blockfrostQueryUtxo proj
+              , Blockfrost.blockfrostLookupDatum proj
+              , Blockfrost.blockfrostSubmitTx proj
+              , Blockfrost.blockfrostAwaitTxConfirmed proj
+              , Blockfrost.blockfrostStakeAddressInfo proj
+              , Blockfrost.blockfrostDRepState proj
+              , Blockfrost.blockfrostDRepsState proj
+              , Blockfrost.blockfrostStakePools proj
+              , Blockfrost.blockfrostConstitution proj
+              , Blockfrost.blockfrostProposals proj
+              , Blockfrost.blockfrostMempoolTxs proj
+              )
+
+        runProviders
+          gyGetParameters
+          gySlotActions'
+          gyQueryUTxO'
+          gyLookupDatum
+          gySubmitTxConfirmed
+          gyAwaitTxConfirmed
+          gyGetStakeAddressInfo
+          gyGetDRepState
+          gyGetDRepsState
+          gyGetStakePools
+          gyGetConstitution
+          gyGetProposals
+          gyGetMempoolTxs
+
+      GYBlockfrostCustom url mkey -> do
+        -- YOUR EXISTING GYBlockfrostCustom BRANCH.
+        -- DO NOT CHANGE THIS BRANCH.
+        (gyGetParameters, gySlotActions', gyQueryUTxO', gyLookupDatum, gySubmitTxConfirmed, gyAwaitTxConfirmed, gyGetStakeAddressInfo, gyGetDRepState, gyGetDRepsState, gyGetStakePools, gyGetConstitution, gyGetProposals, gyGetMempoolTxs) <-
+          do
+            let key = maybe "" id $ coerce mkey
+                proj = Blockfrost.networkIdToProjectCustom url key
+            blockfrostSlotActions <- makeSlotActions slotCachingTime $ Blockfrost.blockfrostGetSlotOfCurrentBlock proj
+            blockfrostGetParams <-
+              makeGetParameters
+                (Blockfrost.blockfrostProtocolParams proj)
+                (Blockfrost.blockfrostSystemStart proj)
+                (Blockfrost.blockfrostEraHistory proj)
+                (Blockfrost.blockfrostGetSlotOfCurrentBlock proj)
+            pure
+              ( blockfrostGetParams
+              , blockfrostSlotActions
+              , Blockfrost.blockfrostQueryUtxo proj
+              , Blockfrost.blockfrostLookupDatum proj
+              , Blockfrost.blockfrostSubmitTx proj
+              , Blockfrost.blockfrostAwaitTxConfirmed proj
+              , Blockfrost.blockfrostStakeAddressInfo proj
+              , Blockfrost.blockfrostDRepState proj
+              , Blockfrost.blockfrostDRepsState proj
+              , Blockfrost.blockfrostStakePools proj
+              , Blockfrost.blockfrostConstitution proj
+              , Blockfrost.blockfrostProposals proj
+              , Blockfrost.blockfrostMempoolTxs proj
+              )
+        runProviders
+          gyGetParameters
+          gySlotActions'
+          gyQueryUTxO'
+          gyLookupDatum
+          gySubmitTxConfirmed
+          gyAwaitTxConfirmed
+          gyGetStakeAddressInfo
+          gyGetDRepState
+          gyGetDRepsState
+          gyGetStakePools
+          gyGetConstitution
+          gyGetProposals
+          gyGetMempoolTxs
+
+      GYUtxoRpc cpiUtxoRpcHost cpiUtxoRpcPort cpiUtxoRpcUseTls -> do
+        let urconf = UtxoRpcApi.UtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime
+        provider <- UtxoRpcApi.mkUtxoRpc urconf
+
+        UtxoRpcApi.withUtxoRpcConnection urconf $ \conn -> do
+          gySlotActions' <-
+            UtxoRpcApi.utxoRpcSlotActions
+              provider
+              conn
+
+          gyGetParameters <-
+            UtxoRpcApi.utxoRpcGetParameters
+              provider
+
+          runProviders
+            gyGetParameters
+            gySlotActions'
+            (UtxoRpcApi.utxoRpcQueryUtxo provider conn)
+            (\_ ->
+              error "UTxO-RPC: datum lookup not implemented")
+            (\_ ->
+              error "UTxO-RPC: transaction submission not implemented")
+            (\_ ->
+              error "UTxO-RPC: transaction confirmation not implemented")
+            (\_ ->
+              error "UTxO-RPC: stake address info not implemented")
+            (\_ ->
+              error "UTxO-RPC: DRep state not implemented")
+            (\_ ->
+              error "UTxO-RPC: DRep states not implemented")
+            (error "UTxO-RPC: stake pools not implemented")
+            (error "UTxO-RPC: constitution not implemented")
+            (\_ ->
+              error "UTxO-RPC: governance proposals not implemented")
+            (error "UTxO-RPC: mempool queries not implemented")
+
+  where
+    runProviders
+      gyGetParameters
+      gySlotActions'
+      gyQueryUTxO'
+      gyLookupDatum
+      gySubmitTx
+      gyAwaitTxConfirmed
+      gyGetStakeAddressInfo
+      gyGetDRepState
+      gyGetDRepsState
+      gyGetStakePools
+      gyGetConstitution
+      gyGetProposals
+      gyGetMempoolTxs =
       bracket (mkLogEnv ns cfgLogging) closeScribes $ \logEnv -> do
         let gyLog' =
               GYLogConfiguration
@@ -350,27 +527,32 @@ withCfgProviders
                 , cfgLogContexts = mempty
                 , cfgLogDirector = Left logEnv
                 }
+
         (gyQueryUTxO, gySlotActions) <-
-          {-if cfgUtxoCacheEnable
-          then do
-              (gyQueryUTxO, purgeCache) <- CachedQuery.makeCachedQueryUTxO gyQueryUTxO' gyLog'
-              -- waiting for the next block will purge the utxo cache.
-              let gySlotActions = gySlotActions' { gyWaitForNextBlock' = purgeCache >> gyWaitForNextBlock' gySlotActions'}
-              pure (gyQueryUTxO, gySlotActions, f)
-          else -} pure (gyQueryUTxO', gySlotActions')
+          pure
+            ( gyQueryUTxO'
+            , gySlotActions'
+            )
+
         let f' =
               maybe
                 f
-                ( \case
+                (\case
                     True -> f . logTiming
                     False -> f
                 )
                 cfgLogTiming
+
         e <- try $ f' GYProviders {..}
+
         case e of
-          Right a -> pure a
+          Right a ->
+            pure a
           Left (err :: SomeException) -> do
-            logRun gyLog' GYError ((printf "ERROR: %s" $ show err) :: String)
+            logRun
+              gyLog'
+              GYError
+              ((printf "ERROR: %s" $ show err) :: String)
             throwIO err
 
 logTiming :: GYProviders -> GYProviders

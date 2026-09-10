@@ -84,6 +84,7 @@ library
     GeniusYield.Providers.Node
     GeniusYield.Providers.Ogmios
     GeniusYield.Providers.Sentry
+    GeniusYield.Providers.UtxoRpc
     GeniusYield.ReadJSON
     GeniusYield.Scripts.TestToken
     GeniusYield.Swagger.Utils
@@ -285,7 +286,9 @@ library
     ouroboros-network-protocols,
     plutus-ledger-api,
     plutus-tx,
-
+    utxorpc >= 0.0.19 && < 0.0.20,
+    grapesy
+    
   -- needed for examples
   -- Version of @plutus-core@ is pinned in @cabal.project@ file.
   build-depends: plutus-core

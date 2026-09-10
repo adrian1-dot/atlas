@@ -11,6 +11,7 @@ repository cardano-haskell-packages
 
 packages: .
 packages: plutus/atlas-onchain-common
+          https://hackage.haskell.org/package/utxorpc-0.0.19.2/utxorpc-0.0.19.2.tar.gz
 
 tests: true
 
@@ -34,6 +35,14 @@ source-repository-package
   location: https://github.com/sourabhxyz/haskell-sdk
   tag: 1e84ccb43aa0f56dd2776e64a9a7341441fc623e
   --sha256: sha256-O9WSVdqZfKYHt5IBCF3+nknswNl/VH8/FTmTW/iAgb8=
+
+-- TODO: Temporary, until https://github.com/maestro-org/haskell-sdk/pull/79 is merged.
+source-repository-package
+  type: git
+  location: https://github.com/sourabhxyz/haskell-sdk
+  tag: 1e84ccb43aa0f56dd2776e64a9a7341441fc623e
+  --sha256: sha256-O9WSVdqZfKYHt5IBCF3+nknswNl/VH8/FTmTW/iAgb8=
+
 
 -- TODO: Temporary, until proposed changes are in upstream (track https://github.com/mlabs-haskell/clb/pull/73)
 source-repository-package
