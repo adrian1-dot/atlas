@@ -1226,15 +1226,23 @@ convertTxOutput ref txOutput = do
 convertDatum :: Datum -> Either String GYOutDatum
 convertDatum datum =
   case datum ^. Cardano_Fields.maybe'payload of
-    Nothing -> do
-      datumHash <-
-        first
-          (\err -> "UTxO-RPC datum hash decode failed: " <> show err)
-          (Api.deserialiseFromRawBytes
-            (Api.AsHash Api.AsScriptData)
-            (datum ^. Cardano_Fields.hash))
+    Nothing
+      | BS.null (datum ^. Cardano_Fields.hash) ->
+          -- Dolos always emits a Datum submessage, even for outputs with no
+          -- datum at all (pallas-utxorpc's map_tx_datum sets hash=[], payload=None
+          -- in that case). Empty hash + no payload means "no datum", not a genuine
+          -- hash-only datum (a real hash is always 32 bytes) -- see TODO.md for the
+          -- upstream Dolos fix to stop emitting this degenerate message.
+          pure GYOutDatumNone
+      | otherwise -> do
+          datumHash <-
+            first
+              (\err -> "UTxO-RPC datum hash decode failed: " <> show err)
+              (Api.deserialiseFromRawBytes
+                (Api.AsHash Api.AsScriptData)
+                (datum ^. Cardano_Fields.hash))
 
-      pure $ GYOutDatumHash (datumHashFromApi datumHash)
+          pure $ GYOutDatumHash (datumHashFromApi datumHash)
 
     Just _payload -> do
       hashableScriptData <-
