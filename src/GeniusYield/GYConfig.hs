@@ -45,6 +45,7 @@ import GeniusYield.Providers.Blockfrost qualified as Blockfrost
 import Data.Sequence qualified as Seq
 import GeniusYield.Providers.CacheLocal
 import GeniusYield.Providers.CacheMempool (augmentQueryUTxOWithMempool)
+import GeniusYield.Providers.Common (mainnetEraHist, preprodEraHist, previewEraHist)
 import GeniusYield.Providers.Kupo qualified as KupoApi
 import GeniusYield.Providers.Maestro qualified as MaestroApi
 import GeniusYield.Providers.Node (nodeGetDRepState, nodeGetDRepsState, nodeStakeAddressInfo)
@@ -57,6 +58,38 @@ import GeniusYield.Types
 -- | How many seconds to keep slots cached, before refetching the data.
 slotCachingTime :: NominalDiffTime
 slotCachingTime = 5
+
+{- | Era history for the 'GYUtxoRpc' provider, keyed by network.
+
+UTxO-RPC's @ReadEraSummary@ (as served by Dolos) only reflects whatever
+era-boundary records the backing node has itself locally processed since it
+started tracking chain state -- it does not reconstruct the full historical
+era table the way a full node or Blockfrost's @/network/eras@ does (Dolos's
+own miniBF @/network/eras@ route performs this reconstruction; its
+gRPC/UTxO-RPC and Ogmios interfaces do not). Atlas' era interpreter is a
+fixed 7-slot (Byron..Conway) structure with no partial form, so a live
+response with fewer summaries can never be parsed into one. We supply the
+network's own permanent historical boundaries instead of asking the backing
+node for them; see 'GeniusYield.Providers.Common.preprodEraHist' et al.
+
+__NOTE:__ must be updated on the next hardfork, same as the fixtures it
+draws on. 'GYPrivnet' has no fixed history to hardcode and is unsupported by
+this provider for that reason.
+-}
+utxoRpcNetworkEraHistory :: GYNetworkId -> IO Api.EraHistory
+utxoRpcNetworkEraHistory GYMainnet = pure $ Api.EraHistory mainnetEraHist
+utxoRpcNetworkEraHistory GYTestnetPreprod = pure $ Api.EraHistory preprodEraHist
+utxoRpcNetworkEraHistory GYTestnetPreview = pure $ Api.EraHistory previewEraHist
+utxoRpcNetworkEraHistory GYTestnetLegacy =
+  throwIO $
+    userError
+      "UTxO-RPC: no hardcoded era history available for GYTestnetLegacy; \
+      \the UtxoRpc provider only supports GYMainnet / GYTestnetPreprod / GYTestnetPreview"
+utxoRpcNetworkEraHistory (GYPrivnet _) =
+  throwIO $
+    userError
+      "UTxO-RPC: no hardcoded era history available for a private network (GYPrivnet); \
+      \the UtxoRpc provider only supports GYMainnet / GYTestnetPreprod / GYTestnetPreview"
 
 -- | Newtype with a custom show instance that prevents showing the contained data.
 newtype Confidential a = Confidential a
@@ -472,6 +505,7 @@ withCfgProviders
       GYUtxoRpc cpiUtxoRpcHost cpiUtxoRpcPort cpiUtxoRpcUseTls -> do
         let urconf = UtxoRpcApi.UtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime
         provider <- UtxoRpcApi.mkUtxoRpc urconf
+        eraHistory <- utxoRpcNetworkEraHistory cfgNetworkId
 
         UtxoRpcApi.withUtxoRpcConnection urconf $ \conn -> do
           gySlotActions' <-
@@ -482,6 +516,7 @@ withCfgProviders
           gyGetParameters <-
             UtxoRpcApi.utxoRpcGetParameters
               provider
+              eraHistory
 
           runProviders
             gyGetParameters

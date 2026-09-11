@@ -15,7 +15,6 @@ import Data.Time (NominalDiffTime)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Short qualified as SBS
-import Data.Word (Word64)
 
 import GeniusYield.Types
 
@@ -26,7 +25,6 @@ import Network.GRPC.Common
 import Data.Bifunctor (first)
 import Data.Map.Strict qualified as Map
 
-import Ouroboros.Consensus.Block.Abstract (GenesisWindow (..))
 import Proto.Utxorpc.V1alpha.Query.Query
 import Proto.Utxorpc.V1alpha.Query.Query_Fields (hash, index , keys, maybe'parsedState, maybe'txoRef, maybe'params, maybe'values)
 import qualified Proto.Utxorpc.V1alpha.Cardano.Cardano_Fields as Cardano_Fields
@@ -46,22 +44,17 @@ import Cardano.Ledger.Conway.PParams
   ( ConwayPParams (..)
   , THKD (..)
   )
-import Data.Maybe (fromMaybe)
 import Data.Ratio ((%))
 
 import Proto.Utxorpc.V1alpha.Cardano.Cardano qualified as ProtoCardano
 
 import Cardano.Ledger.Plutus qualified as LedgerPlutus
-
-import Cardano.Slotting.Slot qualified as CSlot
 import Cardano.Slotting.Time qualified as CTime
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
-import Ouroboros.Consensus.HardFork.History qualified as Ouroboros
-import GeniusYield.Providers.Common (parseEraHist) -- internal module, same package
 
 import Proto.Utxorpc.V1alpha.Query.Query_Fields qualified as Query_Fields
-import Proto.Utxorpc.V1alpha.Cardano.Cardano (Genesis, EraSummary, EraBoundary)
-import Proto.Utxorpc.V1alpha.Cardano.Cardano_Fields (startTime, securityParam, maybe'activeSlotsCoeff)
+import Proto.Utxorpc.V1alpha.Cardano.Cardano (Genesis)
+import Proto.Utxorpc.V1alpha.Cardano.Cardano_Fields (startTime)
 
 type instance RequestMetadata (Protobuf SyncService "readTip") = NoMetadata
 type instance ResponseInitialMetadata (Protobuf SyncService "readTip") = NoMetadata
@@ -186,111 +179,143 @@ utxoRpcSystemStart provider =
         posixSecondsToUTCTime $
           fromIntegral (genesis ^. startTime)
 
---------------------------------------------------------------------------------
+{--------------------------------------------------------------------------------
 -- EraHistory
 --------------------------------------------------------------------------------
 
-utxoRpcEraHistory :: UtxoRpc -> IO Api.EraHistory
-utxoRpcEraHistory provider =
-  withUtxoRpcConnection (utxoRpcConfig provider) $ \conn -> do
-    genesis <- utxoRpcReadGenesis conn
-    genesisWin <- either fail pure (computeGenesisWindow genesis)
+ UTxO-RPC's (Dolos 1.6.0) ReadEraSummary only reflects
+ whatever era-boundary records the backing node (Dolos) has itself locally
+ processed since it started tracking chain state -- it does not
+ reconstruct the full historical era table the way a full node or
+ Blockfrost's /network/eras endpoint does. Dolos's own miniBF
+ /network/eras route already does this padding (see
+ crates/minibf/src/routes/network.rs in the Dolos repo, "Special,
+ hardcoded stuff" block); its gRPC/UTxO-RPC (src/serve/grpc/v1alpha/query.rs
+ read_era_summary) and Ogmios (src/serve/o7s_unix/statequery.rs) interfaces
+ do not. Atlas' era interpreter is a fixed 7-slot (Byron..Conway) structure
+ with no partial form, so a live response with fewer summaries can never
+ be parsed into one.
 
-    response <-
-      nonStreaming
-        conn
-        (rpcWith @(Protobuf QueryService "readEraSummary") def)
-        (Proto (defMessage :: ReadEraSummaryRequest))
+ Era history for the UtxoRpc provider is, for now, supplied by the caller
+ instead (see 'GeniusYield.GYConfig.utxoRpcNetworkEraHistory', a hardcoded
+ per-network table) and threaded into 'utxoRpcGetParameters' below.
 
-    case getProto response ^. Query_Fields.maybe'summary of
-      Nothing ->
-        fail "UTxO-RPC ReadEraSummaryResponse has no summary"
+ The code below is kept, commented out, as the long-term replacement: once
+ Dolos's read_era_summary (gRPC) is patched to reuse miniBF's padding
+ logic, restore this and go back to threading 'utxoRpcEraHistory provider'
+ into 'utxoRpcGetParameters' instead of a hardcoded 'Api.EraHistory'.
 
-      Just (ReadEraSummaryResponse'Cardano eraSummaries) ->
-        let summs = eraSummaries ^. Cardano_Fields.summaries
-        in maybe
-             (fail "UTxO-RPC returned an unexpected number of era summaries")
-             pure
-             (parseEraHist (mkEra genesis genesisWin) summs)
+ import Data.Word (Word64)
+ import Data.Maybe (fromMaybe)
+ import Ouroboros.Consensus.Block.Abstract (GenesisWindow (..))
+ import Cardano.Slotting.Slot qualified as CSlot
+ import Ouroboros.Consensus.HardFork.History qualified as Ouroboros
+ import GeniusYield.Providers.Common (parseEraHist)
+ import Proto.Utxorpc.V1alpha.Cardano.Cardano (EraSummary, EraBoundary)
+ import Proto.Utxorpc.V1alpha.Cardano.Cardano_Fields (securityParam, maybe'activeSlotsCoeff)
 
-  where
-    mkBound :: EraBoundary -> Ouroboros.Bound
-    mkBound b =
-      Ouroboros.Bound
-        { Ouroboros.boundTime = CTime.RelativeTime (fromIntegral (b ^. Cardano_Fields.time))
-        , Ouroboros.boundSlot = CSlot.SlotNo (b ^. Cardano_Fields.slot)
-        , Ouroboros.boundEpoch = CSlot.EpochNo (fromIntegral (b ^. Cardano_Fields.epoch))
-        }
+ utxoRpcEraHistory :: UtxoRpc -> IO Api.EraHistory
+ utxoRpcEraHistory provider =
+   withUtxoRpcConnection (utxoRpcConfig provider) $ \conn -> do
+     genesis <- utxoRpcReadGenesis conn
+     genesisWin <- either fail pure (computeGenesisWindow genesis)
 
-    -- | The spec doesn't hand us epoch/slot length per era, so: for the
-    -- final (unbounded) era use Genesis' own current-era params, and for
-    -- bounded historical eras derive them from that era's own boundaries.
-    mkEraParams :: Genesis -> Word64 -> EraSummary -> Ouroboros.EraParams
-    mkEraParams genesis genesisWin s =
-      case s ^. Cardano_Fields.maybe'end of
-        Nothing ->
-          Ouroboros.EraParams
-            { Ouroboros.eraEpochSize = CSlot.EpochSize (fromIntegral (genesis ^. Cardano_Fields.epochLength))
-            , Ouroboros.eraSlotLength = CTime.mkSlotLength (fromIntegral (genesis ^. Cardano_Fields.slotLength))
-            , Ouroboros.eraSafeZone = Ouroboros.StandardSafeZone genesisWin
-            , Ouroboros.eraGenesisWin = GenesisWindow genesisWin
-            }
-        Just end ->
-          let start' =
-                fromMaybe
-                  (error "UTxO-RPC bounded era summary has no start boundary")
-                  (s ^. Cardano_Fields.maybe'start)
+     response <-
+       nonStreaming
+         conn
+         (rpcWith @(Protobuf QueryService "readEraSummary") def)
+         (Proto (defMessage :: ReadEraSummaryRequest))
 
-              slotDelta = end ^. Cardano_Fields.slot - start' ^. Cardano_Fields.slot
-              epochDelta = end ^. Cardano_Fields.epoch - start' ^. Cardano_Fields.epoch
-              timeDelta = end ^. Cardano_Fields.time - start' ^. Cardano_Fields.time
+     case getProto response ^. Query_Fields.maybe'summary of
+       Nothing ->
+         fail "UTxO-RPC ReadEraSummaryResponse has no summary"
 
-              epochSizeSlots =
-                if epochDelta == 0
-                  then error "UTxO-RPC era summary has zero epoch delta"
-                  else slotDelta `div` epochDelta
+       Just (ReadEraSummaryResponse'Cardano eraSummaries) ->
+         let summs = eraSummaries ^. Cardano_Fields.summaries
+         in maybe
+              (fail "UTxO-RPC returned an unexpected number of era summaries")
+              pure
+              (parseEraHist (mkEra genesis genesisWin) summs)
 
-              slotLenSecs =
-                if slotDelta == 0
-                  then error "UTxO-RPC era summary has zero slot delta"
-                  else fromIntegral timeDelta / fromIntegral slotDelta :: Double
-          in
-            Ouroboros.EraParams
-              { Ouroboros.eraEpochSize = CSlot.EpochSize epochSizeSlots
-              , Ouroboros.eraSlotLength = CTime.mkSlotLength (realToFrac slotLenSecs)
-              , Ouroboros.eraSafeZone = Ouroboros.StandardSafeZone genesisWin
-              , Ouroboros.eraGenesisWin = GenesisWindow genesisWin
-              }
+   where
+     mkBound :: EraBoundary -> Ouroboros.Bound
+     mkBound b =
+       Ouroboros.Bound
+         { Ouroboros.boundTime = CTime.RelativeTime (fromIntegral (b ^. Cardano_Fields.time))
+         , Ouroboros.boundSlot = CSlot.SlotNo (b ^. Cardano_Fields.slot)
+         , Ouroboros.boundEpoch = CSlot.EpochNo (fromIntegral (b ^. Cardano_Fields.epoch))
+         }
 
-    mkEra :: Genesis -> Word64 -> EraSummary -> Ouroboros.EraSummary
-    mkEra genesis genesisWin s =
-      Ouroboros.EraSummary
-        { Ouroboros.eraStart =
-            mkBound $
-              fromMaybe
-                (error "UTxO-RPC era summary has no start boundary")
-                (s ^. Cardano_Fields.maybe'start)
-        , Ouroboros.eraEnd =
-            maybe Ouroboros.EraUnbounded (Ouroboros.EraEnd . mkBound) (s ^. Cardano_Fields.maybe'end)
-        , Ouroboros.eraParams = mkEraParams genesis genesisWin s
-        }
+     -- | The spec doesn't hand us epoch/slot length per era, so: for the
+     -- final (unbounded) era use Genesis' own current-era params, and for
+     -- bounded historical eras derive them from that era's own boundaries.
+     mkEraParams :: Genesis -> Word64 -> EraSummary -> Ouroboros.EraParams
+     mkEraParams genesis genesisWin s =
+       case s ^. Cardano_Fields.maybe'end of
+         Nothing ->
+           Ouroboros.EraParams
+             { Ouroboros.eraEpochSize = CSlot.EpochSize (fromIntegral (genesis ^. Cardano_Fields.epochLength))
+             , Ouroboros.eraSlotLength = CTime.mkSlotLength (fromIntegral (genesis ^. Cardano_Fields.slotLength))
+             , Ouroboros.eraSafeZone = Ouroboros.StandardSafeZone genesisWin
+             , Ouroboros.eraGenesisWin = GenesisWindow genesisWin
+             }
+         Just end ->
+           let start' =
+                 fromMaybe
+                   (error "UTxO-RPC bounded era summary has no start boundary")
+                   (s ^. Cardano_Fields.maybe'start)
 
--- | Safe zone / genesis window, computed as ⌈3k/f⌉ from the security
--- parameter and active slot coefficient, since UTxO-RPC's genesis doesn't
--- expose it directly (same approach/TODO as Atlas' own Maestro provider).
-computeGenesisWindow :: Genesis -> Either String Word64
-computeGenesisWindow genesis = do
-  activeSlotsRat <-
-    maybe
-      (Left "UTxO-RPC genesis has no active_slots_coeff")
-      (convertRational "active_slots_coeff")
-      (genesis ^. maybe'activeSlotsCoeff)
+               slotDelta = end ^. Cardano_Fields.slot - start' ^. Cardano_Fields.slot
+               epochDelta = end ^. Cardano_Fields.epoch - start' ^. Cardano_Fields.epoch
+               timeDelta = end ^. Cardano_Fields.time - start' ^. Cardano_Fields.time
 
-  let k' = toInteger (genesis ^. securityParam)
+               epochSizeSlots =
+                 if epochDelta == 0
+                   then error "UTxO-RPC era summary has zero epoch delta"
+                   else slotDelta `div` epochDelta
 
-  if activeSlotsRat <= 0
-    then Left "UTxO-RPC genesis active_slots_coeff is non-positive"
-    else pure $ ceiling (3 * fromInteger k' / activeSlotsRat)
+               slotLenSecs =
+                 if slotDelta == 0
+                   then error "UTxO-RPC era summary has zero slot delta"
+                   else fromIntegral timeDelta / fromIntegral slotDelta :: Double
+           in
+             Ouroboros.EraParams
+               { Ouroboros.eraEpochSize = CSlot.EpochSize epochSizeSlots
+               , Ouroboros.eraSlotLength = CTime.mkSlotLength (realToFrac slotLenSecs)
+               , Ouroboros.eraSafeZone = Ouroboros.StandardSafeZone genesisWin
+               , Ouroboros.eraGenesisWin = GenesisWindow genesisWin
+               }
+
+     mkEra :: Genesis -> Word64 -> EraSummary -> Ouroboros.EraSummary
+     mkEra genesis genesisWin s =
+       Ouroboros.EraSummary
+         { Ouroboros.eraStart =
+             mkBound $
+               fromMaybe
+                 (error "UTxO-RPC era summary has no start boundary")
+                 (s ^. Cardano_Fields.maybe'start)
+         , Ouroboros.eraEnd =
+             maybe Ouroboros.EraUnbounded (Ouroboros.EraEnd . mkBound) (s ^. Cardano_Fields.maybe'end)
+         , Ouroboros.eraParams = mkEraParams genesis genesisWin s
+         }
+
+ -- | Safe zone / genesis window, computed as (ceil) 3k/f from the security
+ -- parameter and active slot coefficient, since UTxO-RPC's genesis doesn't
+ -- expose it directly (same approach/TODO as Atlas' own Maestro provider).
+ computeGenesisWindow :: Genesis -> Either String Word64
+ computeGenesisWindow genesis = do
+   activeSlotsRat <-
+     maybe
+       (Left "UTxO-RPC genesis has no active_slots_coeff")
+       (convertRational "active_slots_coeff")
+       (genesis ^. maybe'activeSlotsCoeff)
+
+   let k' = toInteger (genesis ^. securityParam)
+
+   if activeSlotsRat <= 0
+     then Left "UTxO-RPC genesis active_slots_coeff is non-positive"
+     else pure $ ceiling (3 * fromInteger k' / activeSlotsRat)
+-}
 
 --------------------------------------------------------------------------------
 -- Slot actions
@@ -317,14 +342,19 @@ utxoRpcSlotActions provider conn =
 --
 -- Atlas caches system start and era history for the lifetime of the provider
 -- and refreshes protocol parameters at epoch boundaries.
+--
+-- Era history is not sourced from UTxO-RPC (see the note above
+-- 'utxoRpcSlotActions' -- Dolos's gRPC interface does not return the full
+-- historical era table); the caller supplies it instead.
 utxoRpcGetParameters ::
   UtxoRpc ->
+  Api.EraHistory ->
   IO GYGetParameters
-utxoRpcGetParameters provider =
+utxoRpcGetParameters provider eraHistory =
   makeGetParameters
     (utxoRpcReadParams provider)
     (utxoRpcSystemStart provider)
-    (utxoRpcEraHistory provider)
+    (pure eraHistory)
     (withUtxoRpcConnection (utxoRpcConfig provider) utxoRpcGetSlotOfCurrentBlock)
 
 utxoRpcReadParams :: UtxoRpc -> IO ApiProtocolParameters
