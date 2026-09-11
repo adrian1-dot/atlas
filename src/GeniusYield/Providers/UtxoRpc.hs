@@ -478,6 +478,14 @@ convertPParams pparams = do
       "min_fee_script_ref_cost_per_byte"
       (pparams ^. Cardano_Fields.maybe'minFeeScriptRefCostPerByte)
 
+  poolVotingThresholds <-
+    convertPoolVotingThresholds
+      (pparams ^. Cardano_Fields.maybe'poolVotingThresholds)
+
+  drepVotingThresholds <-
+    convertDRepVotingThresholds
+      (pparams ^. Cardano_Fields.maybe'drepVotingThresholds)
+
   pure $
     Ledger.PParams $
       ConwayPParams
@@ -544,11 +552,9 @@ convertPParams pparams = do
               fromIntegral $
                 pparams ^. Cardano_Fields.maxCollateralInputs
         , cppPoolVotingThresholds =
-            THKD $
-              error "UTxO-RPC: pool voting thresholds not implemented"
+            THKD poolVotingThresholds
         , cppDRepVotingThresholds =
-            THKD $
-              error "UTxO-RPC: DRep voting thresholds not implemented"
+            THKD drepVotingThresholds
         , cppCommitteeMinSize =
             THKD $
               fromIntegral $
@@ -679,6 +685,144 @@ convertBoundedRational fieldName value = do
         <> " is outside its valid range")
     Right
     (Ledger.boundRational @a rational)
+
+-- 'VotingThresholds' is a flat 'repeated RationalNumber' in the utxorpc proto
+-- (no named sub-fields at this call site) — index order is not documented in
+-- the .proto, but matches how Dolos's grpc/v1alpha/query.rs constructs it
+-- (github.com/txpipe/dolos, src/serve/grpc/v1alpha/query.rs).
+convertPoolVotingThresholds ::
+  Maybe ProtoCardano.VotingThresholds ->
+  Either String Ledger.PoolVotingThresholds
+convertPoolVotingThresholds Nothing =
+  Left "UTxO-RPC protocol parameter pool_voting_thresholds is missing"
+convertPoolVotingThresholds (Just vt) =
+  case vt ^. Cardano_Fields.thresholds of
+    [motionNoConfidence', committeeNormal', committeeNoConfidence', hardForkInitiation', ppSecurityGroup'] -> do
+      motionNoConfidence <-
+        convertBoundedRational @Ledger.UnitInterval
+          "pool_voting_thresholds[0] (motion_no_confidence)"
+          (Just motionNoConfidence')
+
+      committeeNormal <-
+        convertBoundedRational @Ledger.UnitInterval
+          "pool_voting_thresholds[1] (committee_normal)"
+          (Just committeeNormal')
+
+      committeeNoConfidence <-
+        convertBoundedRational @Ledger.UnitInterval
+          "pool_voting_thresholds[2] (committee_no_confidence)"
+          (Just committeeNoConfidence')
+
+      hardForkInitiation <-
+        convertBoundedRational @Ledger.UnitInterval
+          "pool_voting_thresholds[3] (hard_fork_initiation)"
+          (Just hardForkInitiation')
+
+      ppSecurityGroup <-
+        convertBoundedRational @Ledger.UnitInterval
+          "pool_voting_thresholds[4] (pp_security_group)"
+          (Just ppSecurityGroup')
+
+      pure
+        Ledger.PoolVotingThresholds
+          { pvtPPSecurityGroup = ppSecurityGroup
+          , pvtMotionNoConfidence = motionNoConfidence
+          , pvtHardForkInitiation = hardForkInitiation
+          , pvtCommitteeNormal = committeeNormal
+          , pvtCommitteeNoConfidence = committeeNoConfidence
+          }
+    other ->
+      Left $
+        "UTxO-RPC protocol parameter pool_voting_thresholds has "
+          <> show (length other)
+          <> " values, expected 5"
+
+convertDRepVotingThresholds ::
+  Maybe ProtoCardano.VotingThresholds ->
+  Either String Ledger.DRepVotingThresholds
+convertDRepVotingThresholds Nothing =
+  Left "UTxO-RPC protocol parameter drep_voting_thresholds is missing"
+convertDRepVotingThresholds (Just vt) =
+  case vt ^. Cardano_Fields.thresholds of
+    [ motionNoConfidence'
+      , committeeNormal'
+      , committeeNoConfidence'
+      , updateToConstitution'
+      , hardForkInitiation'
+      , ppNetworkGroup'
+      , ppEconomicGroup'
+      , ppTechnicalGroup'
+      , ppGovGroup'
+      , treasuryWithdrawal'
+      ] -> do
+        motionNoConfidence <-
+          convertBoundedRational @Ledger.UnitInterval
+            "drep_voting_thresholds[0] (motion_no_confidence)"
+            (Just motionNoConfidence')
+
+        committeeNormal <-
+          convertBoundedRational @Ledger.UnitInterval
+            "drep_voting_thresholds[1] (committee_normal)"
+            (Just committeeNormal')
+
+        committeeNoConfidence <-
+          convertBoundedRational @Ledger.UnitInterval
+            "drep_voting_thresholds[2] (committee_no_confidence)"
+            (Just committeeNoConfidence')
+
+        updateToConstitution <-
+          convertBoundedRational @Ledger.UnitInterval
+            "drep_voting_thresholds[3] (update_to_constitution)"
+            (Just updateToConstitution')
+
+        hardForkInitiation <-
+          convertBoundedRational @Ledger.UnitInterval
+            "drep_voting_thresholds[4] (hard_fork_initiation)"
+            (Just hardForkInitiation')
+
+        ppNetworkGroup <-
+          convertBoundedRational @Ledger.UnitInterval
+            "drep_voting_thresholds[5] (pp_network_group)"
+            (Just ppNetworkGroup')
+
+        ppEconomicGroup <-
+          convertBoundedRational @Ledger.UnitInterval
+            "drep_voting_thresholds[6] (pp_economic_group)"
+            (Just ppEconomicGroup')
+
+        ppTechnicalGroup <-
+          convertBoundedRational @Ledger.UnitInterval
+            "drep_voting_thresholds[7] (pp_technical_group)"
+            (Just ppTechnicalGroup')
+
+        ppGovGroup <-
+          convertBoundedRational @Ledger.UnitInterval
+            "drep_voting_thresholds[8] (pp_gov_group)"
+            (Just ppGovGroup')
+
+        treasuryWithdrawal <-
+          convertBoundedRational @Ledger.UnitInterval
+            "drep_voting_thresholds[9] (treasury_withdrawal)"
+            (Just treasuryWithdrawal')
+
+        pure
+          Ledger.DRepVotingThresholds
+            { dvtUpdateToConstitution = updateToConstitution
+            , dvtTreasuryWithdrawal = treasuryWithdrawal
+            , dvtPPTechnicalGroup = ppTechnicalGroup
+            , dvtPPNetworkGroup = ppNetworkGroup
+            , dvtPPGovGroup = ppGovGroup
+            , dvtPPEconomicGroup = ppEconomicGroup
+            , dvtMotionNoConfidence = motionNoConfidence
+            , dvtHardForkInitiation = hardForkInitiation
+            , dvtCommitteeNormal = committeeNormal
+            , dvtCommitteeNoConfidence = committeeNoConfidence
+            }
+    other ->
+      Left $
+        "UTxO-RPC protocol parameter drep_voting_thresholds has "
+          <> show (length other)
+          <> " values, expected 10"
 
 convertExUnits ::
   String ->
