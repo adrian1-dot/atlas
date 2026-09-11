@@ -522,23 +522,32 @@ withCfgProviders
             gyGetParameters
             gySlotActions'
             (UtxoRpcApi.utxoRpcQueryUtxo provider conn)
+            (UtxoRpcApi.utxoRpcLookupDatum provider conn)
+            (UtxoRpcApi.utxoRpcSubmitTx provider conn)
+            (UtxoRpcApi.utxoRpcAwaitTxConfirmed provider conn)
+            -- The next four are not stubs pending implementation -- UTxO-RPC
+            -- has no RPC for any of them. 'Certificate'/'DRep'/
+            -- 'PoolRegistrationCert'/'GovernanceActionProposal' exist only as
+            -- shapes embedded in a transaction body (what a tx *did*), never
+            -- as queryable current ledger state. Reconstructing them would
+            -- mean building and running a persistent chain-indexer on top of
+            -- 'dumpHistory'/'watchTx', out of scope for a provider module;
+            -- stake-address reward-account balance is a ledger-computed
+            -- value that can't be reconstructed from on-chain events at all.
+            -- Checked exhaustively against every Request/Response message in
+            -- 'SyncService'/'QueryService'/'SubmitService'/'WatchService' --
+            -- none of them return this state.
             (\_ ->
-              error "UTxO-RPC: datum lookup not implemented")
+              error "UTxO-RPC: stake address info not implemented -- no RPC exposes reward-account state")
             (\_ ->
-              error "UTxO-RPC: transaction submission not implemented")
+              error "UTxO-RPC: DRep state not implemented -- no RPC exposes current DRep registry")
             (\_ ->
-              error "UTxO-RPC: transaction confirmation not implemented")
+              error "UTxO-RPC: DRep states not implemented -- no RPC exposes current DRep registry")
+            (pure (error "UTxO-RPC: stake pools not implemented -- no RPC exposes the pool registry"))
+            (UtxoRpcApi.utxoRpcGetConstitution provider)
             (\_ ->
-              error "UTxO-RPC: stake address info not implemented")
-            (\_ ->
-              error "UTxO-RPC: DRep state not implemented")
-            (\_ ->
-              error "UTxO-RPC: DRep states not implemented")
-            (pure (error "UTxO-RPC: stake pools not implemented"))
-            (error "UTxO-RPC: constitution not implemented")
-            (\_ ->
-              error "UTxO-RPC: governance proposals not implemented")
-            (error "UTxO-RPC: mempool queries not implemented")
+              error "UTxO-RPC: governance proposals not implemented -- no RPC exposes active proposals")
+            (UtxoRpcApi.utxoRpcGetMempoolTxs provider conn)
 
   where
     runProviders

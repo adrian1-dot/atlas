@@ -6,7 +6,31 @@ module GeniusYield.Providers.UtxoRpc (
   utxoRpcGetParameters,
   utxoRpcQueryUtxo,
   utxoRpcGetSlotOfCurrentBlock,
-  withUtxoRpcConnection
+  utxoRpcLookupDatum,
+  utxoRpcSubmitTx,
+  utxoRpcAwaitTxConfirmed,
+  utxoRpcGetMempoolTxs,
+  utxoRpcGetConstitution,
+  withUtxoRpcConnection,
+
+  -- * Pure conversion helpers (exposed for unit testing)
+  convertAddress,
+  convertAddressToBytes,
+  convertBigInt,
+  convertMultiasset,
+  convertAsset,
+  convertTxOutputValue,
+  convertTxOutRef,
+  convertTxoRef,
+  convertTxOutput,
+  convertDatum,
+  convertScript,
+  convertNativeScript,
+  convertNativeScriptList,
+  convertScriptNOfK,
+  convertPParams,
+  convertPoolVotingThresholds,
+  convertDRepVotingThresholds
 ) where
 
 import Cardano.Api qualified as Api
@@ -23,19 +47,29 @@ import Network.GRPC.Client.StreamType.IO
 import Network.GRPC.Common.Protobuf
 import Network.GRPC.Common
 import Data.Bifunctor (first)
+import Data.Functor ((<&>))
 import Data.Map.Strict qualified as Map
+import Control.Concurrent (threadDelay)
+import Control.Exception (throwIO)
 
 import Proto.Utxorpc.V1alpha.Query.Query
-import Proto.Utxorpc.V1alpha.Query.Query_Fields (hash, index , keys, maybe'parsedState, maybe'txoRef, maybe'params, maybe'values)
+import Proto.Utxorpc.V1alpha.Query.Query_Fields (hash, index , keys, maybe'parsedState, maybe'txoRef, maybe'params, maybe'values, nativeBytes, values)
 import qualified Proto.Utxorpc.V1alpha.Cardano.Cardano_Fields as Cardano_Fields
 
 import Proto.Utxorpc.V1alpha.Sync.Sync
 import Proto.Utxorpc.V1alpha.Sync.Sync_Fields qualified as Sync_Fields (maybe'tip, slot)
 import Proto.Utxorpc.V1alpha.Cardano.Cardano_Fields (address, maybe'bigInt, scripts, maybe'script, maybe'nativeScript,
-                                                    maybe'bigInt, assets, coin, name, outputCoin, policyId, k)
+                                                    maybe'bigInt, assets, coin, name, outputCoin, policyId, k,
+                                                    maybe'anchor, url, contentHash, constitution)
 import Proto.Utxorpc.V1alpha.Cardano.Cardano (Asset, BigInt, BigInt'BigInt (..), Multiasset, TxOutput, NativeScript,
                                              Datum, ScriptNOfK, Script'Script (..), NativeScript'NativeScript (..),
                                              Script, NativeScriptList)
+
+-- Imported qualified: 'Proto.Utxorpc.V1alpha.Query.Query' (open above) also
+-- defines an unrelated 'AnyChainTx' (a fetched tx + its block reference), so
+-- an open import here would make the type name ambiguous at every use site.
+import Proto.Utxorpc.V1alpha.Submit.Submit qualified as ProtoSubmit
+import Proto.Utxorpc.V1alpha.Submit.Submit_Fields qualified as Submit_Fields
 
 import Cardano.Api.Ledger qualified as Api.L
 import Cardano.Api.Ledger qualified as Ledger
@@ -79,6 +113,22 @@ type instance ResponseTrailingMetadata (Protobuf QueryService "readEraSummary") 
 type instance RequestMetadata (Protobuf QueryService "searchUtxos") = NoMetadata
 type instance ResponseInitialMetadata (Protobuf QueryService "searchUtxos") = NoMetadata
 type instance ResponseTrailingMetadata (Protobuf QueryService "searchUtxos") = NoMetadata
+
+type instance RequestMetadata (Protobuf QueryService "readData") = NoMetadata
+type instance ResponseInitialMetadata (Protobuf QueryService "readData") = NoMetadata
+type instance ResponseTrailingMetadata (Protobuf QueryService "readData") = NoMetadata
+
+type instance RequestMetadata (Protobuf ProtoSubmit.SubmitService "submitTx") = NoMetadata
+type instance ResponseInitialMetadata (Protobuf ProtoSubmit.SubmitService "submitTx") = NoMetadata
+type instance ResponseTrailingMetadata (Protobuf ProtoSubmit.SubmitService "submitTx") = NoMetadata
+
+type instance RequestMetadata (Protobuf ProtoSubmit.SubmitService "waitForTx") = NoMetadata
+type instance ResponseInitialMetadata (Protobuf ProtoSubmit.SubmitService "waitForTx") = NoMetadata
+type instance ResponseTrailingMetadata (Protobuf ProtoSubmit.SubmitService "waitForTx") = NoMetadata
+
+type instance RequestMetadata (Protobuf ProtoSubmit.SubmitService "readMempool") = NoMetadata
+type instance ResponseInitialMetadata (Protobuf ProtoSubmit.SubmitService "readMempool") = NoMetadata
+type instance ResponseTrailingMetadata (Protobuf ProtoSubmit.SubmitService "readMempool") = NoMetadata
 
 utxoRpcGetSlotOfCurrentBlock :: Connection -> IO GYSlot
 utxoRpcGetSlotOfCurrentBlock conn = do
@@ -1499,3 +1549,188 @@ convertPaymentCredential credential =
       pure $
         Api.serialiseToRawBytes
           (scriptHashToApi scriptHash')
+
+--------------------------------------------------------------------------------
+-- Datum lookup
+--------------------------------------------------------------------------------
+
+-- | Look up a datum by its hash via UTxO-RPC's ReadData.
+utxoRpcLookupDatum :: UtxoRpc -> Connection -> GYLookupDatum
+utxoRpcLookupDatum _provider conn dh = do
+  response <-
+    nonStreaming
+      conn
+      (rpcWith @(Protobuf QueryService "readData") def)
+      (Proto request)
+
+  case getProto response ^. values of
+    [] ->
+      pure Nothing
+
+    item : _ ->
+      case convertAnyChainDatum item of
+        Left err ->
+          fail $ "UTxO-RPC readData conversion failed: " <> err
+
+        Right d ->
+          pure $ Just d
+
+  where
+    request :: ReadDataRequest
+    request =
+      defMessage
+        & keys .~ [Api.serialiseToRawBytes (datumHashToApi dh)]
+
+    convertAnyChainDatum :: AnyChainDatum -> Either String GYDatum
+    convertAnyChainDatum item =
+      first
+        (\err -> "UTxO-RPC datum CBOR decode failed: " <> show err)
+        (datumFromApi' <$> Api.deserialiseFromCBOR Api.AsHashableScriptData (item ^. nativeBytes))
+
+--------------------------------------------------------------------------------
+-- Submit tx
+--------------------------------------------------------------------------------
+
+-- | Submit a signed 'GYTx' via UTxO-RPC's SubmitTx.
+utxoRpcSubmitTx :: UtxoRpc -> Connection -> GYSubmitTx
+utxoRpcSubmitTx _provider conn tx = do
+  response <-
+    nonStreaming
+      conn
+      (rpcWith @(Protobuf ProtoSubmit.SubmitService "submitTx") def)
+      (Proto request)
+
+  either
+    (\err -> fail $ "UTxO-RPC submitTx returned an unparseable tx id: " <> err)
+    pure
+    (first show $ Api.deserialiseFromRawBytes Api.AsTxId (getProto response ^. Submit_Fields.ref))
+    <&> txIdFromApi
+
+  where
+    request :: ProtoSubmit.SubmitTxRequest
+    request =
+      defMessage
+        & Submit_Fields.tx .~
+            ( defMessage
+                & Submit_Fields.raw .~ Api.serialiseToCBOR (txToApi tx)
+            )
+
+--------------------------------------------------------------------------------
+-- Await tx confirmation
+--------------------------------------------------------------------------------
+
+-- | Await confirmation of a submitted 'GYTxId' via UTxO-RPC's WaitForTx.
+--
+-- __NOTE:__ UTxO-RPC's 'WaitForTxResponse' only reports a coarse-grained
+-- 'Stage' (acknowledged\/mempool\/network\/confirmed), not a block-depth
+-- confirmation count. This provider treats 'STAGE_CONFIRMED' as satisfying
+-- any requested 'confirmations' depth -- there is no way to distinguish "1
+-- confirmation" from "N confirmations" over UTxO-RPC as it stands.
+utxoRpcAwaitTxConfirmed :: UtxoRpc -> Connection -> GYAwaitTx
+utxoRpcAwaitTxConfirmed _provider conn params@GYAwaitTxParameters {..} txId =
+  serverStreaming
+    conn
+    (rpcWith @(Protobuf ProtoSubmit.SubmitService "waitForTx") def)
+    (Proto request)
+    (go 0)
+
+  where
+    request :: ProtoSubmit.WaitForTxRequest
+    request =
+      defMessage
+        & Submit_Fields.ref .~ [Api.serialiseToRawBytes (txIdToApi txId)]
+
+    go :: Int -> IO (NextElem (Proto ProtoSubmit.WaitForTxResponse)) -> IO ()
+    go attempt recv
+      | maxAttempts <= attempt =
+          throwIO $ GYAwaitTxException params
+      | otherwise = do
+          next <- recv
+          case next of
+            NoNextElem ->
+              threadDelay checkInterval >> go (attempt + 1) recv
+
+            NextElem response
+              | getProto response ^. Submit_Fields.stage == ProtoSubmit.STAGE_CONFIRMED ->
+                  pure ()
+              | otherwise ->
+                  threadDelay checkInterval >> go (attempt + 1) recv
+
+--------------------------------------------------------------------------------
+-- Mempool
+--------------------------------------------------------------------------------
+
+-- | List the transactions currently sitting in the mempool, via UTxO-RPC's
+-- ReadMempool.
+utxoRpcGetMempoolTxs :: UtxoRpc -> Connection -> IO [GYTx]
+utxoRpcGetMempoolTxs _provider conn = do
+  response <-
+    nonStreaming
+      conn
+      (rpcWith @(Protobuf ProtoSubmit.SubmitService "readMempool") def)
+      (Proto (defMessage :: ProtoSubmit.ReadMempoolRequest))
+
+  let items =
+        getProto response ^. Submit_Fields.items
+
+  case traverse convertTxInMempool items of
+    Left err ->
+      fail $ "UTxO-RPC readMempool conversion failed: " <> err
+
+    Right txs ->
+      pure txs
+
+  where
+    convertTxInMempool :: ProtoSubmit.TxInMempool -> Either String GYTx
+    convertTxInMempool item =
+      first show $
+        txFromCBOR (item ^. Submit_Fields.nativeBytes)
+
+--------------------------------------------------------------------------------
+-- Constitution
+--------------------------------------------------------------------------------
+
+-- | The on-chain constitution, sourced from UTxO-RPC's ReadGenesis.
+utxoRpcGetConstitution :: UtxoRpc -> IO GYConstitution
+utxoRpcGetConstitution provider =
+  withUtxoRpcConnection (utxoRpcConfig provider) $ \conn -> do
+    genesis <- utxoRpcReadGenesis conn
+    either fail pure (convertConstitution (genesis ^. constitution))
+
+  where
+    convertConstitution :: ProtoCardano.Constitution -> Either String GYConstitution
+    convertConstitution constitution' = do
+      anchor' <-
+        maybe
+          (Left "UTxO-RPC genesis constitution has no anchor")
+          Right
+          (constitution' ^. maybe'anchor)
+
+      anchorUrl' <-
+        maybe
+          (Left "UTxO-RPC constitution anchor has an invalid URL")
+          Right
+          (textToUrl (anchor' ^. url))
+
+      anchorDataHash' <-
+        maybe
+          (Left "UTxO-RPC constitution anchor has an invalid content hash")
+          Right
+          (anchorDataHashFromByteString (anchor' ^. contentHash))
+
+      let scriptHash' =
+            if BS.null (constitution' ^. hash)
+              then Nothing
+              else
+                either
+                  (const Nothing)
+                  (Just . scriptHashFromApi)
+                  (Api.deserialiseFromRawBytes Api.AsScriptHash (constitution' ^. hash))
+
+      pure $
+        GYConstitution
+          { constitutionAnchor =
+              GYAnchor anchorUrl' anchorDataHash'
+          , constitutionScript =
+              scriptHash'
+          }

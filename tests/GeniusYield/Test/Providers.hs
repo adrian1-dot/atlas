@@ -62,6 +62,7 @@ import GeniusYield.Providers.Maestro (
   utxoFromMaestro,
  )
 import GeniusYield.Test.Providers.Mashup (providersMashupTests)
+import GeniusYield.Test.Providers.UtxoRpc (utxoRpcProviderTests)
 import GeniusYield.Types (
   GYNetworkId,
   GYQueryUTxO,
@@ -76,7 +77,7 @@ import Maestro.Types.V1 qualified as Maestro
 import Web.HttpApiData (ToHttpApiData (..))
 
 providersTests :: [GYCoreConfig] -> Text.Text -> GYNetworkId -> TestTree
-providersTests configs pToken netId = testGroup "Providers" [testGroup "Maestro" (maestroTests pToken netId), providersMashupTests configs]
+providersTests configs pToken netId = testGroup "Providers" [testGroup "Maestro" (maestroTests pToken netId), providersMashupTests configs, utxoRpcProviderTests]
 
 maestroTests :: Text.Text -> GYNetworkId -> [TestTree]
 maestroTests token netId =

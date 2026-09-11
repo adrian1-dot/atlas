@@ -314,6 +314,7 @@ test-suite atlas-tests
     GeniusYield.Test.GYTxSkeleton
     GeniusYield.Test.Providers
     GeniusYield.Test.Providers.Mashup
+    GeniusYield.Test.Providers.UtxoRpc
     GeniusYield.Test.RefInput
     GeniusYield.Test.SimpleScript
     GeniusYield.Test.SlotConfig
@@ -326,6 +327,7 @@ test-suite atlas-tests
     atlas-cardano,
     atlas-onchain-common,
     base,
+    base16-bytestring,
     bytestring,
     cardano-api,
     clb,
@@ -334,6 +336,7 @@ test-suite atlas-tests
     directory,
     file-embed,
     filepath,
+    grapesy,
     http-api-data,
     maestro-sdk,
     ouroboros-consensus,
@@ -344,6 +347,7 @@ test-suite atlas-tests
     text,
     time,
     transformers,
+    utxorpc,
 
   -- Additional dependencies.
   build-depends:

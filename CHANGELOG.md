@@ -1,3 +1,7 @@
+## Unreleased
+
+* Added a UTxO-RPC (Dolos) provider, `GeniusYield.Providers.UtxoRpc`, wired in as the `GYUtxoRpc` core-config option. Supports UTxO queries (address/payment-credential/asset/ref lookups), protocol parameters, slot actions, datum lookup, transaction submission and confirmation, mempool listing, and the on-chain constitution. `GYAwaitTx`'s `confirmations` depth is not honoured over UTxO-RPC -- `WaitForTx` only reports a coarse stage, not a block-confirmation count, so any requested depth is treated as satisfied once `STAGE_CONFIRMED` is reached. Stake-address info, DRep state, stake pools, and governance proposals are left unimplemented for this provider -- UTxO-RPC exposes no RPC for any of them.
+
 ## 0.14.1
 
 * Added `utxosWithAsset` for efficiently querying of UTxOs containing a specified asset.
