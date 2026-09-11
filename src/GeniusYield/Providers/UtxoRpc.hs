@@ -953,13 +953,13 @@ utxoRpcQueryUtxo provider conn =
     , gyQueryUtxoRefsAtAddress' =
         \address' ->
           utxosRefs
-            <$> utxoRpcQueryAddress provider address' Nothing
+            <$> utxoRpcQueryAddress provider conn address' Nothing
 
     , gyQueryUtxosAtAddress' =
-        utxoRpcQueryAddress provider
+        utxoRpcQueryAddress provider conn
 
     , gyQueryUtxosWithAsset' =
-        utxoRpcQueryAsset provider
+        utxoRpcQueryAsset provider conn
 
     , gyQueryUtxosAtAddressWithDatums' =
         Nothing
@@ -969,14 +969,14 @@ utxoRpcQueryUtxo provider conn =
           mconcat
             <$> traverse
               (\address' ->
-                utxoRpcQueryAddress provider address' Nothing)
+                utxoRpcQueryAddress provider conn address' Nothing)
               addresses
 
     , gyQueryUtxosAtAddressesWithDatums' =
         Nothing
 
     , gyQueryUtxosAtPaymentCredential' =
-        utxoRpcQueryPaymentCredential provider
+        utxoRpcQueryPaymentCredential provider conn
 
     , gyQueryUtxosAtPaymentCredWithDatums' =
         Nothing
@@ -986,7 +986,7 @@ utxoRpcQueryUtxo provider conn =
           mconcat
             <$> traverse
               (\credential ->
-                utxoRpcQueryPaymentCredential provider credential Nothing)
+                utxoRpcQueryPaymentCredential provider conn credential Nothing)
               credentials
 
     , gyQueryUtxosAtPaymentCredsWithDatums' =
@@ -1400,10 +1400,11 @@ utxoRpcSearchUtxos _provider conn pattern' = do
 
 utxoRpcQueryAddress ::
   UtxoRpc ->
+  Connection ->
   GYAddress ->
   Maybe GYAssetClass ->
   IO GYUTxOs
-utxoRpcQueryAddress provider address' assetClass = do
+utxoRpcQueryAddress provider conn address' assetClass = do
   pattern' <-
     case assetClass of
       Nothing ->
@@ -1424,25 +1425,22 @@ utxoRpcQueryAddress provider address' assetClass = do
             & Cardano_Fields.maybe'asset .~ Just
                 (convertAssetPattern assetClass')
 
-  withUtxoRpcConnection
-    (utxoRpcConfig provider)
-    $ \conn ->
-      utxoRpcSearchUtxos provider conn pattern'
+  utxoRpcSearchUtxos provider conn pattern'
 
-utxoRpcQueryAsset :: UtxoRpc -> GYNonAdaToken -> IO GYUTxOs 
-utxoRpcQueryAsset provider (GYNonAdaToken policyId' tokenName) = 
-  withUtxoRpcConnection (utxoRpcConfig provider) $ \conn -> 
-    utxoRpcSearchUtxos provider conn 
-      ( defMessage & Cardano_Fields.maybe'asset .~ Just 
-        ( defMessage & Cardano_Fields.policyId .~ Api.serialiseToRawBytes (mintingPolicyIdToApi policyId') & 
-              Cardano_Fields.assetName .~ Api.serialiseToRawBytes (tokenNameToApi tokenName) ) )
+utxoRpcQueryAsset :: UtxoRpc -> Connection -> GYNonAdaToken -> IO GYUTxOs
+utxoRpcQueryAsset provider conn (GYNonAdaToken policyId' tokenName) =
+  utxoRpcSearchUtxos provider conn
+    ( defMessage & Cardano_Fields.maybe'asset .~ Just
+      ( defMessage & Cardano_Fields.policyId .~ Api.serialiseToRawBytes (mintingPolicyIdToApi policyId') &
+            Cardano_Fields.assetName .~ Api.serialiseToRawBytes (tokenNameToApi tokenName) ) )
 
 utxoRpcQueryPaymentCredential ::
   UtxoRpc ->
+  Connection ->
   GYPaymentCredential ->
   Maybe GYAssetClass ->
   IO GYUTxOs
-utxoRpcQueryPaymentCredential provider credential assetClass = do
+utxoRpcQueryPaymentCredential provider conn credential assetClass = do
   paymentPart' <-
     case convertPaymentCredential credential of
       Left err ->
@@ -1467,10 +1465,7 @@ utxoRpcQueryPaymentCredential provider credential assetClass = do
               & Cardano_Fields.maybe'asset .~ Just
                   (convertAssetPattern assetClass')
 
-  withUtxoRpcConnection
-    (utxoRpcConfig provider)
-    $ \conn ->
-      utxoRpcSearchUtxos provider conn pattern'
+  utxoRpcSearchUtxos provider conn pattern'
 
 convertAssetPattern ::
   GYAssetClass ->
