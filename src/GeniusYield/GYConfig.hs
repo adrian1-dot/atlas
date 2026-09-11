@@ -534,7 +534,7 @@ withCfgProviders
               error "UTxO-RPC: DRep state not implemented")
             (\_ ->
               error "UTxO-RPC: DRep states not implemented")
-            (error "UTxO-RPC: stake pools not implemented")
+            (pure (error "UTxO-RPC: stake pools not implemented"))
             (error "UTxO-RPC: constitution not implemented")
             (\_ ->
               error "UTxO-RPC: governance proposals not implemented")
