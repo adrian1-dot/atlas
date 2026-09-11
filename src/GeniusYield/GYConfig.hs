@@ -45,7 +45,7 @@ import GeniusYield.Providers.Blockfrost qualified as Blockfrost
 import Data.Sequence qualified as Seq
 import GeniusYield.Providers.CacheLocal
 import GeniusYield.Providers.CacheMempool (augmentQueryUTxOWithMempool)
-import GeniusYield.Providers.Common (mainnetEraHist, preprodEraHist, previewEraHist)
+import GeniusYield.Providers.Common (mainnetEraHist, mainnetPlutusV3CostModel, preprodEraHist, preprodPlutusV3CostModel, previewEraHist)
 import GeniusYield.Providers.Kupo qualified as KupoApi
 import GeniusYield.Providers.Maestro qualified as MaestroApi
 import GeniusYield.Providers.Node (nodeGetDRepState, nodeGetDRepsState, nodeStakeAddressInfo)
@@ -90,6 +90,39 @@ utxoRpcNetworkEraHistory (GYPrivnet _) =
     userError
       "UTxO-RPC: no hardcoded era history available for a private network (GYPrivnet); \
       \the UtxoRpc provider only supports GYMainnet / GYTestnetPreprod / GYTestnetPreview"
+
+{- | PlutusV3 cost models for the 'GYUtxoRpc' provider, keyed by network.
+
+Dolos derives "effective" cost models for the current epoch from the wrong
+protocol state, on both its minibf REST and gRPC/UTxO-RPC interfaces (same
+underlying bug either way) -- see
+'GeniusYield.Providers.Common.preprodPlutusV3CostModel' and upstream
+<https://github.com/txpipe/dolos/issues/1274 dolos#1274>. We supply the
+network's current PlutusV3 cost model instead of asking the backing node
+for it, same rationale as 'utxoRpcNetworkEraHistory' above.
+
+__NOTE:__ must be updated on the next hard fork that changes the PlutusV3
+cost model. 'GYPrivnet'/'GYTestnetLegacy' have no fixed model to hardcode
+and are unsupported by this provider, same as era history.
+-}
+utxoRpcNetworkPlutusV3CostModel :: GYNetworkId -> IO [Integer]
+utxoRpcNetworkPlutusV3CostModel GYMainnet = pure mainnetPlutusV3CostModel
+utxoRpcNetworkPlutusV3CostModel GYTestnetPreprod = pure preprodPlutusV3CostModel
+utxoRpcNetworkPlutusV3CostModel GYTestnetPreview =
+  throwIO $
+    userError
+      "UTxO-RPC: no hardcoded PlutusV3 cost model available for GYTestnetPreview yet; \
+      \the UtxoRpc provider only supports GYMainnet / GYTestnetPreprod for cost models"
+utxoRpcNetworkPlutusV3CostModel GYTestnetLegacy =
+  throwIO $
+    userError
+      "UTxO-RPC: no hardcoded PlutusV3 cost model available for GYTestnetLegacy; \
+      \the UtxoRpc provider only supports GYMainnet / GYTestnetPreprod for cost models"
+utxoRpcNetworkPlutusV3CostModel (GYPrivnet _) =
+  throwIO $
+    userError
+      "UTxO-RPC: no hardcoded PlutusV3 cost model available for a private network (GYPrivnet); \
+      \the UtxoRpc provider only supports GYMainnet / GYTestnetPreprod for cost models"
 
 -- | Newtype with a custom show instance that prevents showing the contained data.
 newtype Confidential a = Confidential a
@@ -506,6 +539,7 @@ withCfgProviders
         let urconf = UtxoRpcApi.UtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime
         provider <- UtxoRpcApi.mkUtxoRpc urconf
         eraHistory <- utxoRpcNetworkEraHistory cfgNetworkId
+        plutusV3CostModel <- utxoRpcNetworkPlutusV3CostModel cfgNetworkId
 
         UtxoRpcApi.withUtxoRpcConnection urconf $ \conn -> do
           gySlotActions' <-
@@ -517,6 +551,7 @@ withCfgProviders
             UtxoRpcApi.utxoRpcGetParameters
               provider
               eraHistory
+              plutusV3CostModel
 
           runProviders
             gyGetParameters

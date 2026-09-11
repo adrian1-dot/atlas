@@ -396,19 +396,28 @@ utxoRpcSlotActions provider conn =
 -- Era history is not sourced from UTxO-RPC (see the note above
 -- 'utxoRpcSlotActions' -- Dolos's gRPC interface does not return the full
 -- historical era table); the caller supplies it instead.
+--
+-- The PlutusV3 cost model is likewise not sourced from UTxO-RPC's live
+-- response -- Dolos derives "effective" cost models for the current epoch
+-- from the wrong protocol state on both its minibf REST and gRPC
+-- interfaces (see 'convertCostModels' below and
+-- <https://github.com/txpipe/dolos/issues/1274 dolos#1274>); the caller
+-- supplies the correct current-network value instead
+-- ('GeniusYield.GYConfig.utxoRpcNetworkPlutusV3CostModel').
 utxoRpcGetParameters ::
   UtxoRpc ->
   Api.EraHistory ->
+  [Integer] ->
   IO GYGetParameters
-utxoRpcGetParameters provider eraHistory =
+utxoRpcGetParameters provider eraHistory plutusV3CostModel =
   makeGetParameters
-    (utxoRpcReadParams provider)
+    (utxoRpcReadParams provider plutusV3CostModel)
     (utxoRpcSystemStart provider)
     (pure eraHistory)
     (withUtxoRpcConnection (utxoRpcConfig provider) utxoRpcGetSlotOfCurrentBlock)
 
-utxoRpcReadParams :: UtxoRpc -> IO ApiProtocolParameters
-utxoRpcReadParams provider =
+utxoRpcReadParams :: UtxoRpc -> [Integer] -> IO ApiProtocolParameters
+utxoRpcReadParams provider plutusV3CostModel =
   withUtxoRpcConnection
     (utxoRpcConfig provider)
     $ \conn -> do
@@ -433,7 +442,7 @@ utxoRpcReadParams provider =
             Just params ->
               case params of
                 AnyChainParams'Cardano pparams ->
-                  case convertPParams pparams of
+                  case convertPParams plutusV3CostModel pparams of
                     Left err ->
                       fail $
                         "UTxO-RPC protocol parameters conversion failed: "
@@ -443,9 +452,10 @@ utxoRpcReadParams provider =
                       pure result
 
 convertPParams ::
+  [Integer] ->
   ProtoCardano.PParams ->
   Either String ApiProtocolParameters
-convertPParams pparams = do
+convertPParams plutusV3CostModel pparams = do
   minFeeA <-
     convertCoin
       "min_fee_coefficient"
@@ -497,6 +507,7 @@ convertPParams pparams = do
 
   costModels <-
     convertCostModels
+      plutusV3CostModel
       (pparams ^. Cardano_Fields.maybe'costModels)
 
   prices <-
@@ -923,10 +934,15 @@ convertPrices value =
           , Ledger.prMem = memory
           }
 
+-- | 'Maybe ProtoCardano.CostModels' -> the PlutusV1/V2 fields are still
+-- sourced live from Dolos's response; PlutusV3 is overridden by the caller
+-- (see 'utxoRpcGetParameters') since Dolos's derivation of it is wrong on
+-- both its minibf and gRPC interfaces -- <https://github.com/txpipe/dolos/issues/1274 dolos#1274>.
 convertCostModels ::
+  [Integer] ->
   Maybe ProtoCardano.CostModels ->
   Either String LedgerPlutus.CostModels
-convertCostModels value =
+convertCostModels plutusV3CostModel value =
   case value of
     Nothing ->
       Left "UTxO-RPC protocol parameter cost_models is missing"
@@ -945,10 +961,10 @@ convertCostModels value =
           (models ^. Cardano_Fields.maybe'plutusV2)
 
       v3 <-
-        requiredCostModel
-          "plutus_v3"
-          LedgerPlutus.PlutusV3
-          (models ^. Cardano_Fields.maybe'plutusV3)
+        first show $
+          LedgerPlutus.mkCostModel
+            LedgerPlutus.PlutusV3
+            (fromIntegral <$> plutusV3CostModel)
 
       pure $
         LedgerPlutus.mkCostModels $
