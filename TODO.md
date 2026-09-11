@@ -2,11 +2,19 @@
 
 Open items tracking upstream Dolos/UTxO-RPC behavior this provider works around. Referenced from `src/GeniusYield/Providers/UtxoRpc.hs`.
 
+## Not implemented: staking/governance state queries
+
+`gyGetStakeAddressInfo`, `gyGetDRepState`, `gyGetDRepsState`, `gyGetStakePools`, and `gyGetProposals` (`GYConfig.hs:570-584`) all throw on call -- not a bug or a workaround, a genuine protocol gap. Checked exhaustively against every Request/Response message in UTxO-RPC's `SyncService`/`QueryService`/`SubmitService`/`WatchService`: none of them expose stake-address reward-account balance, the current DRep registry, the pool registry, or active governance proposals. There's nothing upstream to file or wait on here -- this would need a new UTxO-RPC spec message, not a Dolos fix.
+
+Fine as long as nothing calls these (this provider doesn't build staking/governance transactions). A landmine for any future caller that does need them.
+
 ## Degenerate empty `Datum` message on outputs with no datum
 
 `pallas-utxorpc`'s `map_tx_datum` always emits a `Datum` submessage for a UTxO, even when the UTxO has no datum at all -- it sets `hash = []` and `payload = None` in that case, rather than omitting the field. A real datum hash is always 32 bytes, so `convertDatum` special-cases "empty hash + no payload" as `GYOutDatumNone`.
 
 Once this is fixed upstream (Dolos should stop emitting the degenerate message), the empty-hash special case in `convertDatum` can be dropped -- the `Nothing` branch would then only ever mean "genuinely no datum" via the payload field's own absence.
+
+Filed upstream: `txpipe/dolos#1330`.
 
 ## `ReadEraSummary` doesn't return the full historical era table
 
@@ -15,6 +23,8 @@ Dolos's (as of 1.6.0) `ReadEraSummary` (`src/serve/grpc/v1alpha/query.rs`) only 
 Atlas' era interpreter is a fixed 7-slot (Byron..Conway) structure with no partial form, so a live response with fewer summaries can never be parsed into one. Era history for the UtxoRpc provider is, for now, supplied by the caller instead (`GeniusYield.GYConfig.utxoRpcNetworkEraHistory`, a hardcoded per-network table).
 
 The commented-out `utxoRpcEraHistory` block above `utxoRpcSlotActions` in `UtxoRpc.hs` is the long-term replacement: once Dolos's `read_era_summary` is patched to reuse miniBF's padding logic, restore it and thread `utxoRpcEraHistory provider` into `utxoRpcGetParameters` instead of the hardcoded `Api.EraHistory`.
+
+Filed upstream: `txpipe/dolos#1331`.
 
 ## `ReadParams` (and minibf's `/epoch/*/parameters`) return the wrong effective PlutusV3 cost model
 
@@ -26,6 +36,6 @@ Dolos derives the "effective" cost models for the current epoch from the wrong p
 | Dolos minibf REST | 10 | 297 (a third, still-wrong value) |
 | Real network | 11 | 350 |
 
-This is upstream `txpipe/dolos#1274` ("minibf: return the effective Plutus cost models from `/epoch/*/parameters` endpoints"), open since 2026-08-26, no linked PR as of `v2.0.0-alpha.0` (2026-09-11). The issue's own testing covered Mainnet/Preview only -- the preprod measurement above is new signal, worth adding as a comment upstream.
+This is upstream `txpipe/dolos#1274` ("minibf: return the effective Plutus cost models from `/epoch/*/parameters` endpoints"), open since 2026-08-26. That issue is minibf-only; the gRPC `ReadParams` symptom above is a separate code path with its own wrong value, filed separately as `txpipe/dolos#1329`. Preprod measurement and the minibf-on-preprod correction were added as a comment on `#1274`.
 
-Worked around client-side: `preprodPlutusV3CostModel`/`mainnetPlutusV3CostModel` (`Providers/Common.hs`), threaded through `utxoRpcNetworkPlutusV3CostModel` (`GYConfig.hs`) and `convertCostModels` (`UtxoRpc.hs`) to override just the PlutusV3 field -- PlutusV1/V2 are left sourced live from Dolos (not confirmed affected). Once `dolos#1274` is fixed and released, remove the override and let `convertCostModels` derive PlutusV3 from the live `ReadParams` response like V1/V2 already do.
+Worked around client-side: `preprodPlutusV3CostModel`/`mainnetPlutusV3CostModel` (`Providers/Common.hs`), threaded through `utxoRpcNetworkPlutusV3CostModel` (`GYConfig.hs`) and `convertCostModels` (`UtxoRpc.hs`) to override just the PlutusV3 field -- PlutusV1/V2 are left sourced live from Dolos (not confirmed affected). Once both `dolos#1274` and `dolos#1329` are fixed and released, remove the override and let `convertCostModels` derive PlutusV3 from the live `ReadParams` response like V1/V2 already do.
