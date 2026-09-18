@@ -1,6 +1,7 @@
 ## Unreleased
 
 * Added a UTxO-RPC (Dolos) provider, `GeniusYield.Providers.UtxoRpc`, wired in as the `GYUtxoRpc` core-config option. Supports UTxO queries (address/payment-credential/asset/ref lookups), protocol parameters, slot actions, datum lookup, transaction submission and confirmation, mempool listing, and the on-chain constitution. `GYAwaitTx`'s `confirmations` depth is not honoured over UTxO-RPC -- `WaitForTx` only reports a coarse stage, not a block-confirmation count, so any requested depth is treated as satisfied once `STAGE_CONFIRMED` is reached. Stake-address info, DRep state, stake pools, and governance proposals are left unimplemented for this provider -- UTxO-RPC exposes no RPC for any of them.
+* `UtxoRpcConfig` gained three required fields -- `utxoRpcReconnectPolicy`, `utxoRpcDefaultTimeout`, `utxoRpcHTTP2Settings` -- so the integrator decides gRPC reconnection/timeout behaviour instead of it being hardcoded to grapesy's default (`DontReconnect`, i.e. a dropped connection was never retried). Use `defaultUtxoRpcConfig` to keep the old behaviour, or set these explicitly (`exponentialBackoff` is re-exported for the common retry case; anything more custom needs `grapesy` directly).
 
 ## 0.14.1
 

@@ -1,5 +1,7 @@
 module GeniusYield.Providers.UtxoRpc (
   UtxoRpcConfig (..),
+  defaultUtxoRpcConfig,
+  exponentialBackoff,
   UtxoRpc,
   mkUtxoRpc,
   utxoRpcSlotActions,
@@ -150,8 +152,15 @@ utxoRpcGetSlotOfCurrentBlock conn = do
 
 withUtxoRpcConnection :: UtxoRpcConfig -> (Connection -> IO a) -> IO a
 withUtxoRpcConnection config action =
-  withConnection def server action
+  withConnection connParams server action
   where
+    connParams =
+      def
+        { connReconnectPolicy = utxoRpcReconnectPolicy config
+        , connDefaultTimeout = utxoRpcDefaultTimeout config
+        , connHTTP2Settings = utxoRpcHTTP2Settings config
+        }
+
     address' =
       Address
         (utxoRpcHost config)
@@ -169,15 +178,49 @@ withUtxoRpcConnection config action =
 
 -- | Configuration for an UTxO-RPC endpoint.
 --
--- The endpoint is deliberately provider-neutral.  Dolos is one possible
--- implementation of the UTxO-RPC server, but this provider is written
--- against the UTxO-RPC protocol rather than against Dolos itself.
+-- The endpoint is deliberately provider-neutral. Dolos is one possible
+-- implementation of the UTxO-RPC server, but this provider targets the
+-- UTxO-RPC protocol, not Dolos specifically.
+--
+-- The gRPC connection fields ('utxoRpcReconnectPolicy',
+-- 'utxoRpcDefaultTimeout', 'utxoRpcHTTP2Settings') are required, not
+-- defaulted, so callers must consciously decide them. Use
+-- 'defaultUtxoRpcConfig' to fall back to grapesy's own defaults (no
+-- reconnect, no timeout, default HTTP/2 tuning).
 data UtxoRpcConfig = UtxoRpcConfig
   { utxoRpcHost :: !String
   , utxoRpcPort :: !Int
   , utxoRpcUseTls :: !Bool
   , utxoRpcSlotCacheTime :: !NominalDiffTime
+  , utxoRpcReconnectPolicy :: !ReconnectPolicy
+  -- ^ Reconnect behaviour on a lost/failed connection. Use
+  -- 'exponentialBackoff' for retries, or build a custom 'ReconnectPolicy'
+  -- via @grapesy@ (@Network.GRPC.Client@) directly -- not re-exported here.
+  , utxoRpcDefaultTimeout :: !(Maybe Timeout)
+  -- ^ Per-call timeout. 'Nothing' means calls can hang forever on a wedged
+  -- connection, which also blocks 'utxoRpcReconnectPolicy' from ever
+  -- triggering. Build a 'Timeout' via @grapesy@ directly.
+  , utxoRpcHTTP2Settings :: !HTTP2Settings
+  -- ^ HTTP/2 tuning (window sizes, @TCP_NODELAY@, frame rate limits).
+  -- Build via @grapesy@ (@Network.GRPC.Common@) directly.
   }
+
+-- | 'UtxoRpcConfig' with grapesy's defaults: no reconnect, no timeout,
+-- default HTTP/2 tuning. Override via record update, e.g.:
+--
+-- > (defaultUtxoRpcConfig host port useTls slotCacheTime)
+-- >   { utxoRpcReconnectPolicy = exponentialBackoff threadDelay 1.5 (0.5, 2.0) 10 }
+defaultUtxoRpcConfig :: String -> Int -> Bool -> NominalDiffTime -> UtxoRpcConfig
+defaultUtxoRpcConfig host port useTls slotCacheTime =
+  UtxoRpcConfig
+    { utxoRpcHost = host
+    , utxoRpcPort = port
+    , utxoRpcUseTls = useTls
+    , utxoRpcSlotCacheTime = slotCacheTime
+    , utxoRpcReconnectPolicy = DontReconnect
+    , utxoRpcDefaultTimeout = Nothing
+    , utxoRpcHTTP2Settings = def
+    }
 
 --------------------------------------------------------------------------------
 -- Provider

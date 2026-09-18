@@ -536,7 +536,9 @@ withCfgProviders
           gyGetMempoolTxs
 
       GYUtxoRpc cpiUtxoRpcHost cpiUtxoRpcPort cpiUtxoRpcUseTls -> do
-        let urconf = UtxoRpcApi.UtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime
+        -- Uses grapesy's own defaults (no reconnect, no timeout). Override
+        -- by editing this call site with your own 'UtxoRpcConfig' values.
+        let urconf = UtxoRpcApi.defaultUtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime
         provider <- UtxoRpcApi.mkUtxoRpc urconf
         eraHistory <- utxoRpcNetworkEraHistory cfgNetworkId
         plutusV3CostModel <- utxoRpcNetworkPlutusV3CostModel cfgNetworkId
