@@ -11,6 +11,7 @@ module GeniusYield.GYConfig (
   GYCoreConfig (..),
   Confidential (..),
   GYCoreProviderInfo (..),
+  GYUtxoRpcRetryConfig (..),
   withCfgProviders,
   coreConfigIO,
   coreProviderIO,
@@ -22,7 +23,9 @@ module GeniusYield.GYConfig (
   isUtxoRpc,
 ) where
 
+import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, bracket, try)
+import Network.GRPC.Client (Timeout (..), TimeoutUnit (..), TimeoutValue (TimeoutValue), exponentialBackoff)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.TH
 import Data.Aeson.Types
@@ -157,6 +160,27 @@ $( deriveFromJSON
     ''LocalTxSubmissionCacheSettings
  )
 
+-- | Reconnect/timeout tuning for the 'GYUtxoRpc' connection. Plain numeric
+-- fields (not the raw grapesy 'ReconnectPolicy'/'Timeout' types) so this can
+-- ride along on 'GYCoreProviderInfo's auto-derived 'FromJSON' -- a
+-- 'ReconnectPolicy' embeds an 'IO' action and can't be JSON-derived.
+data GYUtxoRpcRetryConfig = GYUtxoRpcRetryConfig
+  { urrcMaxAttempts :: !Word
+  , urrcExponent :: !Double
+  , urrcDelayLoSec :: !Double
+  , urrcDelayHiSec :: !Double
+  , urrcTimeoutSec :: !Word
+  }
+  deriving stock Show
+
+$( deriveFromJSON
+    defaultOptions
+      { fieldLabelModifier = \fldName -> case drop 4 fldName of x : xs -> toLower x : xs; [] -> []
+      , sumEncoding = UntaggedValue
+      }
+    ''GYUtxoRpcRetryConfig
+ )
+
 {- |
 The supported providers. The options are:
 
@@ -182,7 +206,7 @@ data GYCoreProviderInfo
   | GYMaestro {cpiMaestroToken :: !(Confidential Text), cpiTurboSubmit :: !(Maybe Bool)}
   | GYBlockfrost {cpiBlockfrostKey :: !(Confidential Text)}
   | GYBlockfrostCustom {cpiBlockfrostUrl :: !Text, cpiMaybeBlockfrostKey :: !(Maybe (Confidential Text))}
-  | GYUtxoRpc {cpiUtxoRpcHost :: !Text, cpiUtxoRpcPort :: !Int, cpiUtxoRpcUseTls :: !Bool}
+  | GYUtxoRpc {cpiUtxoRpcHost :: !Text, cpiUtxoRpcPort :: !Int, cpiUtxoRpcUseTls :: !Bool, cpiUtxoRpcRetry :: !(Maybe GYUtxoRpcRetryConfig)}
   deriving stock Show
 
 $( deriveFromJSON
@@ -535,10 +559,17 @@ withCfgProviders
           gyGetProposals
           gyGetMempoolTxs
 
-      GYUtxoRpc cpiUtxoRpcHost cpiUtxoRpcPort cpiUtxoRpcUseTls -> do
-        -- Uses grapesy's own defaults (no reconnect, no timeout). Override
-        -- by editing this call site with your own 'UtxoRpcConfig' values.
-        let urconf = UtxoRpcApi.defaultUtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime
+      GYUtxoRpc cpiUtxoRpcHost cpiUtxoRpcPort cpiUtxoRpcUseTls cpiUtxoRpcRetry -> do
+        -- cpiUtxoRpcRetry is Nothing => grapesy's own defaults (no reconnect,
+        -- no timeout), matching prior behaviour. The integrator (whoever
+        -- constructs GYUtxoRpc) decides the curve, not this module.
+        let urconf = case cpiUtxoRpcRetry of
+              Nothing -> UtxoRpcApi.defaultUtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime
+              Just GYUtxoRpcRetryConfig{urrcMaxAttempts, urrcExponent, urrcDelayLoSec, urrcDelayHiSec, urrcTimeoutSec} ->
+                (UtxoRpcApi.defaultUtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime)
+                  { UtxoRpcApi.utxoRpcReconnectPolicy = exponentialBackoff threadDelay urrcExponent (urrcDelayLoSec, urrcDelayHiSec) urrcMaxAttempts
+                  , UtxoRpcApi.utxoRpcDefaultTimeout = Just (Timeout Second (TimeoutValue urrcTimeoutSec))
+                  }
         provider <- UtxoRpcApi.mkUtxoRpc urconf
         eraHistory <- utxoRpcNetworkEraHistory cfgNetworkId
         plutusV3CostModel <- utxoRpcNetworkPlutusV3CostModel cfgNetworkId
