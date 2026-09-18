@@ -233,6 +233,7 @@ library
     network-uri,
     postgresql-simple,
     prettyprinter,
+    random,
     raven-haskell,
     resourcet,
     safe-money,

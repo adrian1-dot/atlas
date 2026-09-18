@@ -25,7 +25,9 @@ module GeniusYield.GYConfig (
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, bracket, try)
-import Network.GRPC.Client (Timeout (..), TimeoutUnit (..), TimeoutValue (TimeoutValue), exponentialBackoff)
+import Network.GRPC.Client (Timeout (..), TimeoutUnit (..), TimeoutValue (TimeoutValue), ReconnectPolicy (..))
+import Network.GRPC.Common (Default (def))
+import System.Random (randomRIO)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.TH
 import Data.Aeson.Types
@@ -164,11 +166,23 @@ $( deriveFromJSON
 -- fields (not the raw grapesy 'ReconnectPolicy'/'Timeout' types) so this can
 -- ride along on 'GYCoreProviderInfo's auto-derived 'FromJSON' -- a
 -- 'ReconnectPolicy' embeds an 'IO' action and can't be JSON-derived.
+--
+-- The resulting policy grows the delay exponentially from
+-- (urrcDelayLoSec, urrcDelayHiSec) by urrcExponent each attempt, capped at
+-- urrcDelayCapSec, and retries indefinitely at the capped rate rather than
+-- giving up after a fixed attempt count. Matches the established pattern in
+-- this org for Dolos/UTxO-RPC consumers with no reliable orchestrator
+-- restart backstop -- see andamioscan's watcher.go (issue #78: capped, not
+-- attempt-limited, "giving up would silently stop indexing") and
+-- andamio-sponsorship-sidecar's background-consolidation backoff (60s cap,
+-- never exits on exhaustion). See
+-- 'GeniusYield.Providers.UtxoRpc.exponentialBackoff' if you specifically
+-- want the bounded-attempts version instead (build 'UtxoRpcConfig' directly).
 data GYUtxoRpcRetryConfig = GYUtxoRpcRetryConfig
-  { urrcMaxAttempts :: !Word
-  , urrcExponent :: !Double
+  { urrcExponent :: !Double
   , urrcDelayLoSec :: !Double
   , urrcDelayHiSec :: !Double
+  , urrcDelayCapSec :: !Double
   , urrcTimeoutSec :: !Word
   }
   deriving stock Show
@@ -180,6 +194,26 @@ $( deriveFromJSON
       }
     ''GYUtxoRpcRetryConfig
  )
+
+-- | Exponential backoff that grows from @(lo, hi)@ by @exponent@ each
+-- attempt, clamped to @capSec@, and retries indefinitely at the capped rate
+-- -- unlike 'GeniusYield.Providers.UtxoRpc.exponentialBackoff', this never
+-- reaches 'DontReconnect'. Suitable for a long-lived connection that should
+-- keep trying to recover from an outage of any length, not just a handful
+-- of attempts.
+cappedIndefiniteBackoff ::
+     (Int -> IO ())
+  -> Double
+  -> (Double, Double)
+  -> Double
+  -> ReconnectPolicy
+cappedIndefiniteBackoff waitFor e = go
+  where
+    go :: (Double, Double) -> Double -> ReconnectPolicy
+    go (lo, hi) capSec = ReconnectAfter def $ do
+      delay <- randomRIO (lo, hi)
+      waitFor $ round $ delay * 1_000_000
+      pure $ go (min capSec (lo * e), min capSec (hi * e)) capSec
 
 {- |
 The supported providers. The options are:
@@ -565,9 +599,9 @@ withCfgProviders
         -- constructs GYUtxoRpc) decides the curve, not this module.
         let urconf = case cpiUtxoRpcRetry of
               Nothing -> UtxoRpcApi.defaultUtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime
-              Just GYUtxoRpcRetryConfig{urrcMaxAttempts, urrcExponent, urrcDelayLoSec, urrcDelayHiSec, urrcTimeoutSec} ->
+              Just GYUtxoRpcRetryConfig{urrcExponent, urrcDelayLoSec, urrcDelayHiSec, urrcDelayCapSec, urrcTimeoutSec} ->
                 (UtxoRpcApi.defaultUtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime)
-                  { UtxoRpcApi.utxoRpcReconnectPolicy = exponentialBackoff threadDelay urrcExponent (urrcDelayLoSec, urrcDelayHiSec) urrcMaxAttempts
+                  { UtxoRpcApi.utxoRpcReconnectPolicy = cappedIndefiniteBackoff threadDelay urrcExponent (urrcDelayLoSec, urrcDelayHiSec) urrcDelayCapSec
                   , UtxoRpcApi.utxoRpcDefaultTimeout = Just (Timeout Second (TimeoutValue urrcTimeoutSec))
                   }
         provider <- UtxoRpcApi.mkUtxoRpc urconf
