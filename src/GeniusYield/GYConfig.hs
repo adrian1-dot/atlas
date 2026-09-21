@@ -25,8 +25,7 @@ module GeniusYield.GYConfig (
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, bracket, try)
-import Network.GRPC.Client (Timeout (..), TimeoutUnit (..), TimeoutValue (TimeoutValue), ReconnectPolicy (..))
-import Network.GRPC.Common (Default (def))
+import Network.GRPC.Client (Timeout (..), TimeoutUnit (..), TimeoutValue (TimeoutValue), ReconnectPolicy (..), ReconnectDecision (..), Reconnect (..), ReconnectTo (..))
 import System.Random (randomRIO)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.TH
@@ -210,10 +209,14 @@ cappedIndefiniteBackoff ::
 cappedIndefiniteBackoff waitFor e = go
   where
     go :: (Double, Double) -> Double -> ReconnectPolicy
-    go (lo, hi) capSec = ReconnectAfter def $ do
+    go (lo, hi) capSec = ReconnectPolicy $ do
       delay <- randomRIO (lo, hi)
       waitFor $ round $ delay * 1_000_000
-      pure $ go (min capSec (lo * e), min capSec (hi * e)) capSec
+      pure $ DoReconnect Reconnect
+        { reconnectTo = ReconnectToOriginal
+        , onReconnect = Nothing
+        , nextPolicy = go (min capSec (lo * e), min capSec (hi * e)) capSec
+        }
 
 {- |
 The supported providers. The options are:

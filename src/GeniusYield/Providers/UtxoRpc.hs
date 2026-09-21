@@ -14,6 +14,7 @@ module GeniusYield.Providers.UtxoRpc (
   utxoRpcGetMempoolTxs,
   utxoRpcGetConstitution,
   withUtxoRpcConnection,
+  UtxoRpcConn,
 
   -- * Pure conversion helpers (exposed for unit testing)
   convertAddress,
@@ -51,8 +52,8 @@ import Network.GRPC.Common
 import Data.Bifunctor (first)
 import Data.Functor ((<&>))
 import Data.Map.Strict qualified as Map
-import Control.Concurrent (threadDelay)
-import Control.Exception (throwIO)
+import Control.Concurrent (threadDelay, MVar, newMVar, readMVar, takeMVar, putMVar)
+import Control.Exception (throwIO, catch, finally)
 
 import Proto.Utxorpc.V1alpha.Query.Query
 import Proto.Utxorpc.V1alpha.Query.Query_Fields (hash, index , keys, maybe'parsedState, maybe'txoRef, maybe'params, maybe'values, nativeBytes, values)
@@ -132,13 +133,14 @@ type instance RequestMetadata (Protobuf ProtoSubmit.SubmitService "readMempool")
 type instance ResponseInitialMetadata (Protobuf ProtoSubmit.SubmitService "readMempool") = NoMetadata
 type instance ResponseTrailingMetadata (Protobuf ProtoSubmit.SubmitService "readMempool") = NoMetadata
 
-utxoRpcGetSlotOfCurrentBlock :: Maybe Timeout -> Connection -> IO GYSlot
-utxoRpcGetSlotOfCurrentBlock timeout conn = do
+utxoRpcGetSlotOfCurrentBlock :: Maybe Timeout -> UtxoRpcConn -> IO GYSlot
+utxoRpcGetSlotOfCurrentBlock timeout uc = do
   response <-
-    nonStreaming
-      conn
-      (rpcWith @(Protobuf SyncService "readTip") def{ callTimeout = timeout })
-      (Proto (defMessage :: ReadTipRequest))
+    utxoRpcCallWithReconnect uc $ \conn ->
+      nonStreaming
+        conn
+        (rpcWith @(Protobuf SyncService "readTip") def{ callTimeout = timeout })
+        (Proto (defMessage :: ReadTipRequest))
 
   case getProto response ^. Sync_Fields.maybe'tip of
     Nothing ->
@@ -150,9 +152,72 @@ utxoRpcGetSlotOfCurrentBlock timeout conn = do
 -- Configuration
 --------------------------------------------------------------------------------
 
-withUtxoRpcConnection :: UtxoRpcConfig -> (Connection -> IO a) -> IO a
-withUtxoRpcConnection config action =
-  withConnection connParams server action
+-- | A UTxO-RPC connection that can rebuild itself.
+--
+-- Wraps grapesy's 'Connection' behind an 'MVar' instead of handing out the
+-- raw immutable value. grapesy's own reconnect machinery
+-- ('connReconnectPolicy'\/'stayConnected') only ever re-triggers when a
+-- /new/ connection attempt fails -- it never notices an established
+-- connection dying silently between calls (no keepalive/ping exists in
+-- grapesy as of 1.2.0; see
+-- <https://github.com/well-typed/grapesy/issues/228>). When that happens,
+-- the wedged call fails fast via 'callTimeout'
+-- ('GrpcException' with 'GrpcDeadlineExceeded'), and
+-- 'utxoRpcCallWithReconnect' below explicitly closes the dead connection
+-- and opens a fresh one, so the /next/ call gets a working connection
+-- instead of hanging forever on the same dead one. The failing call itself
+-- is not retried -- see 'utxoRpcCallWithReconnect'.
+data UtxoRpcConn = UtxoRpcConn
+  { ucConnVar :: !(MVar Connection)
+  , ucConnParams :: !ConnParams
+  , ucServer :: !Server
+  }
+
+-- | Run a UTxO-RPC call against the current connection, rebuilding it if the
+-- call fails with 'GrpcDeadlineExceeded'.
+--
+-- __NOTE:__ the /failing/ call is not retried against the rebuilt
+-- connection -- it still fails, exactly as it did before this fix, just
+-- without leaving the connection wedged for good. Only the /next/ call
+-- benefits from the fresh connection. This is a deliberate scope decision,
+-- not an oversight: transparent retry would need every call site to be
+-- safely re-driveable (submitTx in particular is not obviously safe to
+-- silently retry), so it is left for a future pass if needed.
+--
+-- Concurrent failures on the same dead connection are not deduplicated:
+-- two calls failing at nearly the same time may both close the old
+-- connection and open a new one, wasting one redial. Accepted for now --
+-- see the 'MVar' comment on 'ucConnVar' if this needs tightening later.
+utxoRpcCallWithReconnect :: UtxoRpcConn -> (Connection -> IO a) -> IO a
+utxoRpcCallWithReconnect uc action = do
+  conn <- readMVar (ucConnVar uc)
+  action conn `catch` \e -> do
+    case e of
+      GrpcException{grpcError = GrpcDeadlineExceeded} ->
+        rebuildUtxoRpcConn uc
+      _ ->
+        pure ()
+    throwIO e
+
+-- | Close the current (dead) connection and open a fresh one in its place.
+--
+-- Uses the 'MVar' itself as the single-flight lock: whoever is between
+-- 'takeMVar' and 'putMVar' here is the only thread doing the rebuild;
+-- everyone else (a concurrent failing call, or a normal 'readMVar' caller)
+-- just blocks until it is done.
+rebuildUtxoRpcConn :: UtxoRpcConn -> IO ()
+rebuildUtxoRpcConn uc = do
+  old <- takeMVar (ucConnVar uc)
+  closeConnection old
+  new <- openConnection (ucConnParams uc) (ucServer uc)
+  putMVar (ucConnVar uc) new
+
+withUtxoRpcConnection :: UtxoRpcConfig -> (UtxoRpcConn -> IO a) -> IO a
+withUtxoRpcConnection config action = do
+  initial <- openConnection connParams server
+  connVar <- newMVar initial
+  let uc = UtxoRpcConn { ucConnVar = connVar, ucConnParams = connParams, ucServer = server }
+  action uc `finally` (readMVar connVar >>= closeConnection)
   where
     connParams =
       def
@@ -217,7 +282,7 @@ defaultUtxoRpcConfig host port useTls slotCacheTime =
     , utxoRpcPort = port
     , utxoRpcUseTls = useTls
     , utxoRpcSlotCacheTime = slotCacheTime
-    , utxoRpcReconnectPolicy = DontReconnect
+    , utxoRpcReconnectPolicy = def
     , utxoRpcDefaultTimeout = Nothing
     , utxoRpcHTTP2Settings = def
     }
@@ -244,13 +309,14 @@ mkUtxoRpc config =
 -- Genesis
 --------------------------------------------------------------------------------
 
-utxoRpcReadGenesis :: Maybe Timeout -> Connection -> IO Genesis
-utxoRpcReadGenesis timeout conn = do
+utxoRpcReadGenesis :: Maybe Timeout -> UtxoRpcConn -> IO Genesis
+utxoRpcReadGenesis timeout uc = do
   response <-
-    nonStreaming
-      conn
-      (rpcWith @(Protobuf QueryService "readGenesis") def{ callTimeout = timeout })
-      (Proto (defMessage :: ReadGenesisRequest))
+    utxoRpcCallWithReconnect uc $ \conn ->
+      nonStreaming
+        conn
+        (rpcWith @(Protobuf QueryService "readGenesis") def{ callTimeout = timeout })
+        (Proto (defMessage :: ReadGenesisRequest))
 
   case getProto response ^. Query_Fields.maybe'config of
     Nothing ->
@@ -420,7 +486,7 @@ utxoRpcSystemStart provider =
 -- lifetime must cover the Atlas provider callback.
 utxoRpcSlotActions ::
   UtxoRpc ->
-  Connection ->
+  UtxoRpcConn ->
   IO GYSlotActions
 utxoRpcSlotActions provider conn =
   makeSlotActions
@@ -465,10 +531,11 @@ utxoRpcReadParams provider plutusV3CostModel =
     (utxoRpcConfig provider)
     $ \conn -> do
       response <-
-        nonStreaming
-          conn
-          (rpcWith @(Protobuf QueryService "readParams") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
-          (Proto (defMessage :: ReadParamsRequest))
+        utxoRpcCallWithReconnect conn $ \c ->
+          nonStreaming
+            c
+            (rpcWith @(Protobuf QueryService "readParams") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
+            (Proto (defMessage :: ReadParamsRequest))
 
       let chainParams =
             getProto response ^. maybe'values
@@ -1047,7 +1114,7 @@ requiredCostModel fieldName language value =
 -- The *_WithDatums fields remain 'Nothing'.  Atlas' default implementations
 -- would otherwise attempt to use gyLookupDatum, which is deliberately not
 -- part of the initial UTxO-RPC provider.
-utxoRpcQueryUtxo :: UtxoRpc -> Connection -> GYQueryUTxO
+utxoRpcQueryUtxo :: UtxoRpc -> UtxoRpcConn -> GYQueryUTxO
 utxoRpcQueryUtxo provider conn =
   GYQueryUTxO
     { gyQueryUtxosAtTxOutRefs' =
@@ -1106,13 +1173,14 @@ utxoRpcQueryUtxo provider conn =
 -- ReadUtxos
 --------------------------------------------------------------------------------
 
-utxoRpcReadUtxos :: UtxoRpc -> Connection -> [GYTxOutRef] -> IO GYUTxOs
-utxoRpcReadUtxos provider conn refs = do
+utxoRpcReadUtxos :: UtxoRpc -> UtxoRpcConn -> [GYTxOutRef] -> IO GYUTxOs
+utxoRpcReadUtxos provider uc refs = do
   response <-
-    nonStreaming
-      conn
-      (rpcWith @(Protobuf QueryService "readUtxos") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
-      (Proto request)
+    utxoRpcCallWithReconnect uc $ \conn ->
+      nonStreaming
+        conn
+        (rpcWith @(Protobuf QueryService "readUtxos") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
+        (Proto request)
 
   let responseItems =
         getProto response ^. Query_Fields.items
@@ -1153,7 +1221,7 @@ utxoRpcReadUtxos provider conn refs = do
 
 utxoRpcReadUtxoAtTxOutRef ::
   UtxoRpc ->
-  Connection ->
+  UtxoRpcConn ->
   GYTxOutRef ->
   IO (Maybe GYUTxO)
 utxoRpcReadUtxoAtTxOutRef provider conn ref = do
@@ -1451,15 +1519,16 @@ convertScriptNOfK scriptNOfK =
 
 utxoRpcSearchUtxos ::
   UtxoRpc ->
-  Connection ->
+  UtxoRpcConn ->
   ProtoCardano.TxOutputPattern ->
   IO GYUTxOs
-utxoRpcSearchUtxos provider conn pattern' = do
+utxoRpcSearchUtxos provider uc pattern' = do
   response <-
-    nonStreaming
-      conn
-      (rpcWith @(Protobuf QueryService "searchUtxos") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
-      (Proto request)
+    utxoRpcCallWithReconnect uc $ \conn ->
+      nonStreaming
+        conn
+        (rpcWith @(Protobuf QueryService "searchUtxos") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
+        (Proto request)
 
   let responseItems =
         getProto response ^. Query_Fields.items
@@ -1509,7 +1578,7 @@ utxoRpcSearchUtxos provider conn pattern' = do
 
 utxoRpcQueryAddress ::
   UtxoRpc ->
-  Connection ->
+  UtxoRpcConn ->
   GYAddress ->
   Maybe GYAssetClass ->
   IO GYUTxOs
@@ -1536,7 +1605,7 @@ utxoRpcQueryAddress provider conn address' assetClass = do
 
   utxoRpcSearchUtxos provider conn pattern'
 
-utxoRpcQueryAsset :: UtxoRpc -> Connection -> GYNonAdaToken -> IO GYUTxOs
+utxoRpcQueryAsset :: UtxoRpc -> UtxoRpcConn -> GYNonAdaToken -> IO GYUTxOs
 utxoRpcQueryAsset provider conn (GYNonAdaToken policyId' tokenName) =
   utxoRpcSearchUtxos provider conn
     ( defMessage & Cardano_Fields.maybe'asset .~ Just
@@ -1545,7 +1614,7 @@ utxoRpcQueryAsset provider conn (GYNonAdaToken policyId' tokenName) =
 
 utxoRpcQueryPaymentCredential ::
   UtxoRpc ->
-  Connection ->
+  UtxoRpcConn ->
   GYPaymentCredential ->
   Maybe GYAssetClass ->
   IO GYUTxOs
@@ -1614,13 +1683,14 @@ convertPaymentCredential credential =
 --------------------------------------------------------------------------------
 
 -- | Look up a datum by its hash via UTxO-RPC's ReadData.
-utxoRpcLookupDatum :: UtxoRpc -> Connection -> GYLookupDatum
-utxoRpcLookupDatum provider conn dh = do
+utxoRpcLookupDatum :: UtxoRpc -> UtxoRpcConn -> GYLookupDatum
+utxoRpcLookupDatum provider uc dh = do
   response <-
-    nonStreaming
-      conn
-      (rpcWith @(Protobuf QueryService "readData") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
-      (Proto request)
+    utxoRpcCallWithReconnect uc $ \conn ->
+      nonStreaming
+        conn
+        (rpcWith @(Protobuf QueryService "readData") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
+        (Proto request)
 
   case getProto response ^. values of
     [] ->
@@ -1651,13 +1721,14 @@ utxoRpcLookupDatum provider conn dh = do
 --------------------------------------------------------------------------------
 
 -- | Submit a signed 'GYTx' via UTxO-RPC's SubmitTx.
-utxoRpcSubmitTx :: UtxoRpc -> Connection -> GYSubmitTx
-utxoRpcSubmitTx provider conn tx = do
+utxoRpcSubmitTx :: UtxoRpc -> UtxoRpcConn -> GYSubmitTx
+utxoRpcSubmitTx provider uc tx = do
   response <-
-    nonStreaming
-      conn
-      (rpcWith @(Protobuf ProtoSubmit.SubmitService "submitTx") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
-      (Proto request)
+    utxoRpcCallWithReconnect uc $ \conn ->
+      nonStreaming
+        conn
+        (rpcWith @(Protobuf ProtoSubmit.SubmitService "submitTx") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
+        (Proto request)
 
   either
     (\err -> fail $ "UTxO-RPC submitTx returned an unparseable tx id: " <> err)
@@ -1685,8 +1756,14 @@ utxoRpcSubmitTx provider conn tx = do
 -- confirmation count. This provider treats 'STAGE_CONFIRMED' as satisfying
 -- any requested 'confirmations' depth -- there is no way to distinguish "1
 -- confirmation" from "N confirmations" over UTxO-RPC as it stands.
-utxoRpcAwaitTxConfirmed :: UtxoRpc -> Connection -> GYAwaitTx
-utxoRpcAwaitTxConfirmed _provider conn params@GYAwaitTxParameters {..} txId =
+utxoRpcAwaitTxConfirmed :: UtxoRpc -> UtxoRpcConn -> GYAwaitTx
+utxoRpcAwaitTxConfirmed _provider uc params@GYAwaitTxParameters {..} txId = do
+  -- NOTE: deliberately not routed through 'utxoRpcCallWithReconnect' -- this
+  -- call has no 'callTimeout' (see the note at its call site), so it can
+  -- never observe 'GrpcDeadlineExceeded' to rebuild on. Parked pending a
+  -- decision on a separate, longer timeout for this specifically
+  -- long-running wait; see andamio-atlas-api-v2#81.
+  conn <- readMVar (ucConnVar uc)
   serverStreaming
     conn
     (rpcWith @(Protobuf ProtoSubmit.SubmitService "waitForTx") def)
@@ -1721,13 +1798,14 @@ utxoRpcAwaitTxConfirmed _provider conn params@GYAwaitTxParameters {..} txId =
 
 -- | List the transactions currently sitting in the mempool, via UTxO-RPC's
 -- ReadMempool.
-utxoRpcGetMempoolTxs :: UtxoRpc -> Connection -> IO [GYTx]
-utxoRpcGetMempoolTxs provider conn = do
+utxoRpcGetMempoolTxs :: UtxoRpc -> UtxoRpcConn -> IO [GYTx]
+utxoRpcGetMempoolTxs provider uc = do
   response <-
-    nonStreaming
-      conn
-      (rpcWith @(Protobuf ProtoSubmit.SubmitService "readMempool") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
-      (Proto (defMessage :: ProtoSubmit.ReadMempoolRequest))
+    utxoRpcCallWithReconnect uc $ \conn ->
+      nonStreaming
+        conn
+        (rpcWith @(Protobuf ProtoSubmit.SubmitService "readMempool") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
+        (Proto (defMessage :: ProtoSubmit.ReadMempoolRequest))
 
   let items =
         getProto response ^. Submit_Fields.items
