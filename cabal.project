@@ -15,13 +15,41 @@ packages: plutus/atlas-onchain-common
 
 tests: true
 
+-- hedgehog-extras-0.7.2.0's Test/Unit.hs relies on hw-prelude re-exporting MonadIO
+-- (fixed upstream in hedgehog-extras-0.10.1.0 by importing it explicitly instead).
+-- Force a recent-enough hw-prelude so that re-export is actually present.
+constraints: hw-prelude >= 0.0.5
+
+-- ouroboros-consensus-cardano-0.23.0.0's Mempool.hs uses Data.Validation's
+-- pre-1.2 `validate`/`toEither` API (removed/renamed in validation-1.2.0's
+-- redesign). Pin to the last version that still has them; unbounded upstream,
+-- only dependent in the plan is ouroboros-consensus-cardano.
+constraints: validation ==1.1.5
+
+-- cardano-node-10.3.1's Parsers.hs calls OptI.renderShowS, which
+-- optparse-applicative-fork stopped re-exporting between 0.18.1.0 and
+-- 0.19.0.0 (still imported/used internally, just dropped from the export
+-- list). cardano-node.cabal only declares `>= 0.18.1`, no upper bound.
+-- Pin to the last fork release that still exports it; only 4 dependents
+-- in the plan (cardano-node/cardano-cli/cardano-testnet/trace-dispatcher).
+constraints: optparse-applicative-fork ==0.18.1.0
+
+-- atlas-cardano's own GeniusYield.Types.OpenApi converts between swagger2's
+-- and openapi3's Schema types via each package's private InsOrdHashMap
+-- compat shim (both vendor their own, by design, to insulate against
+-- insert-ordered-containers-0.3's breaking change). Both are unbounded in
+-- atlas-cardano.cabal; the widened index moved them from the
+-- known-good-and-frozen 3.2.4/2.8.9 pair to 3.2.5/2.9.1, whose shims no
+-- longer unify. Pin back to the pair the original freeze verified worked.
+constraints: openapi3 ==3.2.4, swagger2 ==2.8.9
+
 -- repeating the index-state for hackage to work around hackage.nix parsing limitation
-index-state: 2025-04-15T19:49:23Z
+index-state: 2026-09-18T19:12:00Z
 
 -- NOTE: Do not bump chap index beyond that used by target cardano-node version.
 index-state:
-  , hackage.haskell.org 2025-04-15T19:49:23Z
-  , cardano-haskell-packages 2025-04-11T16:42:25Z
+  , hackage.haskell.org 2026-09-18T19:12:00Z
+  , cardano-haskell-packages 2026-09-15T21:40:46Z
 
 -- TODO: Default value should be @direct@ in upcoming 3.10 version of cabal, omit this line then.
 test-show-details: direct

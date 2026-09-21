@@ -132,12 +132,12 @@ type instance RequestMetadata (Protobuf ProtoSubmit.SubmitService "readMempool")
 type instance ResponseInitialMetadata (Protobuf ProtoSubmit.SubmitService "readMempool") = NoMetadata
 type instance ResponseTrailingMetadata (Protobuf ProtoSubmit.SubmitService "readMempool") = NoMetadata
 
-utxoRpcGetSlotOfCurrentBlock :: Connection -> IO GYSlot
-utxoRpcGetSlotOfCurrentBlock conn = do
+utxoRpcGetSlotOfCurrentBlock :: Maybe Timeout -> Connection -> IO GYSlot
+utxoRpcGetSlotOfCurrentBlock timeout conn = do
   response <-
     nonStreaming
       conn
-      (rpcWith @(Protobuf SyncService "readTip") def)
+      (rpcWith @(Protobuf SyncService "readTip") def{ callTimeout = timeout })
       (Proto (defMessage :: ReadTipRequest))
 
   case getProto response ^. Sync_Fields.maybe'tip of
@@ -244,12 +244,12 @@ mkUtxoRpc config =
 -- Genesis
 --------------------------------------------------------------------------------
 
-utxoRpcReadGenesis :: Connection -> IO Genesis
-utxoRpcReadGenesis conn = do
+utxoRpcReadGenesis :: Maybe Timeout -> Connection -> IO Genesis
+utxoRpcReadGenesis timeout conn = do
   response <-
     nonStreaming
       conn
-      (rpcWith @(Protobuf QueryService "readGenesis") def)
+      (rpcWith @(Protobuf QueryService "readGenesis") def{ callTimeout = timeout })
       (Proto (defMessage :: ReadGenesisRequest))
 
   case getProto response ^. Query_Fields.maybe'config of
@@ -266,7 +266,7 @@ utxoRpcReadGenesis conn = do
 utxoRpcSystemStart :: UtxoRpc -> IO SystemStart
 utxoRpcSystemStart provider =
   withUtxoRpcConnection (utxoRpcConfig provider) $ \conn -> do
-    genesis <- utxoRpcReadGenesis conn
+    genesis <- utxoRpcReadGenesis (utxoRpcDefaultTimeout $ utxoRpcConfig provider) conn
     pure $
       CTime.SystemStart $
         posixSecondsToUTCTime $
@@ -310,13 +310,13 @@ utxoRpcSystemStart provider =
  utxoRpcEraHistory :: UtxoRpc -> IO Api.EraHistory
  utxoRpcEraHistory provider =
    withUtxoRpcConnection (utxoRpcConfig provider) $ \conn -> do
-     genesis <- utxoRpcReadGenesis conn
+     genesis <- utxoRpcReadGenesis (utxoRpcDefaultTimeout $ utxoRpcConfig provider) conn
      genesisWin <- either fail pure (computeGenesisWindow genesis)
 
      response <-
        nonStreaming
          conn
-         (rpcWith @(Protobuf QueryService "readEraSummary") def)
+         (rpcWith @(Protobuf QueryService "readEraSummary") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
          (Proto (defMessage :: ReadEraSummaryRequest))
 
      case getProto response ^. Query_Fields.maybe'summary of
@@ -425,7 +425,7 @@ utxoRpcSlotActions ::
 utxoRpcSlotActions provider conn =
   makeSlotActions
     (utxoRpcSlotCacheTime $ utxoRpcConfig provider)
-    (utxoRpcGetSlotOfCurrentBlock conn)
+    (utxoRpcGetSlotOfCurrentBlock (utxoRpcDefaultTimeout $ utxoRpcConfig provider) conn)
 
 --------------------------------------------------------------------------------
 -- Protocol parameters
@@ -457,7 +457,7 @@ utxoRpcGetParameters provider eraHistory plutusV3CostModel =
     (utxoRpcReadParams provider plutusV3CostModel)
     (utxoRpcSystemStart provider)
     (pure eraHistory)
-    (withUtxoRpcConnection (utxoRpcConfig provider) utxoRpcGetSlotOfCurrentBlock)
+    (withUtxoRpcConnection (utxoRpcConfig provider) (utxoRpcGetSlotOfCurrentBlock (utxoRpcDefaultTimeout $ utxoRpcConfig provider)))
 
 utxoRpcReadParams :: UtxoRpc -> [Integer] -> IO ApiProtocolParameters
 utxoRpcReadParams provider plutusV3CostModel =
@@ -467,7 +467,7 @@ utxoRpcReadParams provider plutusV3CostModel =
       response <-
         nonStreaming
           conn
-          (rpcWith @(Protobuf QueryService "readParams") def)
+          (rpcWith @(Protobuf QueryService "readParams") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
           (Proto (defMessage :: ReadParamsRequest))
 
       let chainParams =
@@ -1107,11 +1107,11 @@ utxoRpcQueryUtxo provider conn =
 --------------------------------------------------------------------------------
 
 utxoRpcReadUtxos :: UtxoRpc -> Connection -> [GYTxOutRef] -> IO GYUTxOs
-utxoRpcReadUtxos _provider conn refs = do
+utxoRpcReadUtxos provider conn refs = do
   response <-
     nonStreaming
       conn
-      (rpcWith @(Protobuf QueryService "readUtxos") def)
+      (rpcWith @(Protobuf QueryService "readUtxos") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
       (Proto request)
 
   let responseItems =
@@ -1454,11 +1454,11 @@ utxoRpcSearchUtxos ::
   Connection ->
   ProtoCardano.TxOutputPattern ->
   IO GYUTxOs
-utxoRpcSearchUtxos _provider conn pattern' = do
+utxoRpcSearchUtxos provider conn pattern' = do
   response <-
     nonStreaming
       conn
-      (rpcWith @(Protobuf QueryService "searchUtxos") def)
+      (rpcWith @(Protobuf QueryService "searchUtxos") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
       (Proto request)
 
   let responseItems =
@@ -1615,11 +1615,11 @@ convertPaymentCredential credential =
 
 -- | Look up a datum by its hash via UTxO-RPC's ReadData.
 utxoRpcLookupDatum :: UtxoRpc -> Connection -> GYLookupDatum
-utxoRpcLookupDatum _provider conn dh = do
+utxoRpcLookupDatum provider conn dh = do
   response <-
     nonStreaming
       conn
-      (rpcWith @(Protobuf QueryService "readData") def)
+      (rpcWith @(Protobuf QueryService "readData") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
       (Proto request)
 
   case getProto response ^. values of
@@ -1652,11 +1652,11 @@ utxoRpcLookupDatum _provider conn dh = do
 
 -- | Submit a signed 'GYTx' via UTxO-RPC's SubmitTx.
 utxoRpcSubmitTx :: UtxoRpc -> Connection -> GYSubmitTx
-utxoRpcSubmitTx _provider conn tx = do
+utxoRpcSubmitTx provider conn tx = do
   response <-
     nonStreaming
       conn
-      (rpcWith @(Protobuf ProtoSubmit.SubmitService "submitTx") def)
+      (rpcWith @(Protobuf ProtoSubmit.SubmitService "submitTx") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
       (Proto request)
 
   either
@@ -1722,11 +1722,11 @@ utxoRpcAwaitTxConfirmed _provider conn params@GYAwaitTxParameters {..} txId =
 -- | List the transactions currently sitting in the mempool, via UTxO-RPC's
 -- ReadMempool.
 utxoRpcGetMempoolTxs :: UtxoRpc -> Connection -> IO [GYTx]
-utxoRpcGetMempoolTxs _provider conn = do
+utxoRpcGetMempoolTxs provider conn = do
   response <-
     nonStreaming
       conn
-      (rpcWith @(Protobuf ProtoSubmit.SubmitService "readMempool") def)
+      (rpcWith @(Protobuf ProtoSubmit.SubmitService "readMempool") def{ callTimeout = utxoRpcDefaultTimeout (utxoRpcConfig provider) })
       (Proto (defMessage :: ProtoSubmit.ReadMempoolRequest))
 
   let items =
@@ -1753,7 +1753,7 @@ utxoRpcGetMempoolTxs _provider conn = do
 utxoRpcGetConstitution :: UtxoRpc -> IO GYConstitution
 utxoRpcGetConstitution provider =
   withUtxoRpcConnection (utxoRpcConfig provider) $ \conn -> do
-    genesis <- utxoRpcReadGenesis conn
+    genesis <- utxoRpcReadGenesis (utxoRpcDefaultTimeout $ utxoRpcConfig provider) conn
     either fail pure (convertConstitution (genesis ^. constitution))
 
   where
