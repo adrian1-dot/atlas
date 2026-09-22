@@ -292,7 +292,18 @@ trackConnectivity flag (ReconnectPolicy act) = ReconnectPolicy $ do
 
 withUtxoRpcConnection :: UtxoRpcConfig -> (UtxoRpcConn -> IO a) -> IO a
 withUtxoRpcConnection config action = do
-  connected <- newTVarIO False
+  -- Optimistic initial value: at this point 'openConnection' has not even
+  -- been called yet, so there is no observed disconnect to justify 'False'.
+  -- A call made before the first real state transition falls through to
+  -- 'dispatch' and blocks on the real (bounded-by-the-race) acquisition,
+  -- preserving "wait for ready" semantics for a healthy startup. If the
+  -- initial connect genuinely fails, that failure runs the same wrapped
+  -- reconnect-policy hook as any later disconnect (grapesy's own docs:
+  -- "disconnected... or fail to establish a connection" are the same
+  -- event), flipping this to 'False' and letting the race in
+  -- 'utxoRpcCallWithReconnect' cancel the stuck first call instead of
+  -- leaving it hanging.
+  connected <- newTVarIO True
   let connParams' =
         connParams
           { connOnConnection = OnConnection $ do
