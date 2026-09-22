@@ -53,6 +53,9 @@ import Data.Bifunctor (first)
 import Data.Functor ((<&>))
 import Data.Map.Strict qualified as Map
 import Control.Concurrent (threadDelay, MVar, newMVar, readMVar, takeMVar, putMVar)
+import Control.Concurrent.Async (race)
+import Control.Concurrent.STM (TVar, newTVarIO, readTVarIO, atomically)
+import Control.Concurrent.STM qualified as STM
 import Control.Exception (throwIO, catch, finally)
 
 import Proto.Utxorpc.V1alpha.Query.Query
@@ -171,10 +174,34 @@ data UtxoRpcConn = UtxoRpcConn
   { ucConnVar :: !(MVar Connection)
   , ucConnParams :: !ConnParams
   , ucServer :: !Server
+  , ucConnected :: !(TVar Bool)
+  -- ^ Our own view of connectivity, kept in sync via 'trackConnectivity'
+  -- below hooking grapesy's public 'ReconnectPolicy'\/'onReconnect'\/
+  -- 'connOnConnection' callbacks. grapesy's 'Connection' is opaque and its
+  -- internal readiness 'TVar' (@getConnectionToServer@,
+  -- @Network.GRPC.Client.Connection@) is not part of the public API (it is
+  -- @other-modules@ in grapesy's own @.cabal@), so we cannot read it
+  -- directly -- this flag is the substitute, driven by the same disconnect
+  -- events grapesy's own reconnect loop reacts to.
   }
 
 -- | Run a UTxO-RPC call against the current connection, rebuilding it if the
 -- call fails with 'GrpcDeadlineExceeded'.
+--
+-- Before dispatching, checks 'ucConnected'. If it is currently 'False' (a
+-- disconnect has been observed and no reconnect has succeeded yet), fails
+-- immediately with 'GrpcUnavailable' rather than dispatching at all --
+-- dispatching would otherwise block indefinitely on grapesy's own
+-- connection-acquisition wait, which is not bounded by 'callTimeout' (that
+-- watchdog only starts once a connection has already been obtained).
+--
+-- If the flag is (or was) 'True', the call is raced against a watch on the
+-- same flag: if a disconnect is detected /while/ the call is in flight
+-- (including while it is still stuck acquiring a connection, from having
+-- read the flag a moment before it flipped), the watch side wins and the
+-- call is cancelled rather than left to hang. This closes the gap between
+-- reading the flag and actually dispatching, which is otherwise a real
+-- reappearance of the same unbounded wait for whichever caller lands in it.
 --
 -- __NOTE:__ the /failing/ call is not retried against the rebuilt
 -- connection -- it still fails, exactly as it did before this fix, just
@@ -188,16 +215,40 @@ data UtxoRpcConn = UtxoRpcConn
 -- two calls failing at nearly the same time may both close the old
 -- connection and open a new one, wasting one redial. Accepted for now --
 -- see the 'MVar' comment on 'ucConnVar' if this needs tightening later.
+--
+-- A failed flag check does /not/ call 'rebuildUtxoRpcConn' -- only a real
+-- dispatched call's 'GrpcDeadlineExceeded' does, same as before this fix.
+-- 'rebuildUtxoRpcConn' opens a fresh connection with a fresh
+-- 'stayConnected' thread and backoff schedule; calling it from the flag
+-- check as well would mean every failing caller during a sustained outage
+-- restarts that schedule, defeating 'cappedIndefiniteBackoff''s pacing. The
+-- background reconnect (driven by whatever 'ReconnectPolicy' the caller
+-- configured) is already retrying on its own regardless of any caller.
 utxoRpcCallWithReconnect :: UtxoRpcConn -> (Connection -> IO a) -> IO a
 utxoRpcCallWithReconnect uc action = do
-  conn <- readMVar (ucConnVar uc)
-  action conn `catch` \e -> do
-    case e of
-      GrpcException{grpcError = GrpcDeadlineExceeded} ->
-        rebuildUtxoRpcConn uc
-      _ ->
-        pure ()
-    throwIO e
+  believedUp <- readTVarIO (ucConnected uc)
+  if not believedUp
+    then throwGrpcError GrpcUnavailable
+    else do
+      conn <- readMVar (ucConnVar uc)
+      outcome <-
+        race
+          (atomically $ do
+            v <- STM.readTVar (ucConnected uc)
+            if v then STM.retry else pure ())
+          (dispatch conn)
+      case outcome of
+        Left () -> throwGrpcError GrpcUnavailable
+        Right a -> pure a
+  where
+    dispatch conn =
+      action conn `catch` \e -> do
+        case e of
+          GrpcException{grpcError = GrpcDeadlineExceeded} ->
+            rebuildUtxoRpcConn uc
+          _ ->
+            pure ()
+        throwIO e
 
 -- | Close the current (dead) connection and open a fresh one in its place.
 --
@@ -205,6 +256,10 @@ utxoRpcCallWithReconnect uc action = do
 -- 'takeMVar' and 'putMVar' here is the only thread doing the rebuild;
 -- everyone else (a concurrent failing call, or a normal 'readMVar' caller)
 -- just blocks until it is done.
+--
+-- Reuses 'ucConnParams' as-is, so the connectivity tracking wired into it
+-- by 'withUtxoRpcConnection' carries over to the rebuilt connection without
+-- needing to be re-applied here.
 rebuildUtxoRpcConn :: UtxoRpcConn -> IO ()
 rebuildUtxoRpcConn uc = do
   old <- takeMVar (ucConnVar uc)
@@ -212,11 +267,42 @@ rebuildUtxoRpcConn uc = do
   new <- openConnection (ucConnParams uc) (ucServer uc)
   putMVar (ucConnVar uc) new
 
+-- | Wrap a 'ReconnectPolicy' so its action clears 'flag' to 'False' as its
+-- first step every time it runs. grapesy's own 'stayConnected' loop
+-- (@Network.GRPC.Client.Run@) sets its internal readiness state to
+-- \"not ready\" /before/ invoking the reconnect policy, so this always
+-- observes a disconnect at least as promptly as grapesy's own internal
+-- state does. Also threads a matching 'onReconnect' hook through every
+-- subsequent policy in the chain, chaining any hook the wrapped policy
+-- already supplied rather than discarding it.
+trackConnectivity :: TVar Bool -> ReconnectPolicy -> ReconnectPolicy
+trackConnectivity flag (ReconnectPolicy act) = ReconnectPolicy $ do
+  atomically $ STM.writeTVar flag False
+  decision <- act
+  pure $ case decision of
+    DontReconnect -> DontReconnect
+    DoReconnect r ->
+      DoReconnect
+        r
+          { onReconnect = Just $ OnConnection $ do
+              atomically $ STM.writeTVar flag True
+              maybe (pure ()) runOnConnection (onReconnect r)
+          , nextPolicy = trackConnectivity flag (nextPolicy r)
+          }
+
 withUtxoRpcConnection :: UtxoRpcConfig -> (UtxoRpcConn -> IO a) -> IO a
 withUtxoRpcConnection config action = do
-  initial <- openConnection connParams server
+  connected <- newTVarIO False
+  let connParams' =
+        connParams
+          { connOnConnection = OnConnection $ do
+              atomically $ STM.writeTVar connected True
+              runOnConnection (connOnConnection connParams)
+          , connReconnectPolicy = trackConnectivity connected (connReconnectPolicy connParams)
+          }
+  initial <- openConnection connParams' server
   connVar <- newMVar initial
-  let uc = UtxoRpcConn { ucConnVar = connVar, ucConnParams = connParams, ucServer = server }
+  let uc = UtxoRpcConn { ucConnVar = connVar, ucConnParams = connParams', ucServer = server, ucConnected = connected }
   action uc `finally` (readMVar connVar >>= closeConnection)
   where
     connParams =
