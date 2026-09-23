@@ -13,6 +13,18 @@ packages: .
 packages: plutus/atlas-onchain-common
           https://hackage.haskell.org/package/utxorpc-0.0.19.2/utxorpc-0.0.19.2.tar.gz
 
+-- Patched grapesy fork: idle-timeout + keepalive-ping fields, needed by
+-- GYConfig.hs's HTTP2Settings wiring. Not upstreamed yet.
+--
+-- Only applies when this cabal.project is used directly; downstream
+-- consumers must pin the same fork themselves (their cabal.project is
+-- never consulted, only this repo's .cabal bounds are).
+source-repository-package
+  type: git
+  location: https://github.com/adrian1-dot/grapesy.git
+  tag: dbb4b91a454b88df343983c16214d387bf79059b
+  subdir: grapesy
+
 tests: true
 
 -- hedgehog-extras-0.7.2.0's Test/Unit.hs relies on hw-prelude re-exporting MonadIO

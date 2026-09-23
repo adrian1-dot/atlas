@@ -26,6 +26,7 @@ module GeniusYield.GYConfig (
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, bracket, try)
 import Network.GRPC.Client (Timeout (..), TimeoutUnit (..), TimeoutValue (TimeoutValue), ReconnectPolicy (..), ReconnectDecision (..), Reconnect (..), ReconnectTo (..))
+import Network.GRPC.Common (HTTP2Settings (..), defaultHTTP2Settings)
 import System.Random (randomRIO)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.TH
@@ -183,6 +184,11 @@ data GYUtxoRpcRetryConfig = GYUtxoRpcRetryConfig
   , urrcDelayHiSec :: !Double
   , urrcDelayCapSec :: !Double
   , urrcTimeoutSec :: !Word
+  , urrcKeepAlivePingIntervalSec :: !(Maybe Double)
+  -- ^ HTTP/2 keepalive PING interval. 'Nothing' disables it (grapesy default).
+  , urrcIdleTimeoutSec :: !(Maybe Double)
+  -- ^ Idle-connection timeout override (backstop for the ping above).
+  -- 'Nothing' keeps grapesy's default (30s).
   }
   deriving stock Show
 
@@ -217,6 +223,10 @@ cappedIndefiniteBackoff waitFor e = go
         , onReconnect = Nothing
         , nextPolicy = go (min capSec (lo * e), min capSec (hi * e)) capSec
         }
+
+-- | Seconds to microseconds, for grapesy's 'HTTP2Settings'.
+secondsToMicros :: Double -> Int
+secondsToMicros = round . (* 1_000_000)
 
 {- |
 The supported providers. The options are:
@@ -602,10 +612,15 @@ withCfgProviders
         -- constructs GYUtxoRpc) decides the curve, not this module.
         let urconf = case cpiUtxoRpcRetry of
               Nothing -> UtxoRpcApi.defaultUtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime
-              Just GYUtxoRpcRetryConfig{urrcExponent, urrcDelayLoSec, urrcDelayHiSec, urrcDelayCapSec, urrcTimeoutSec} ->
+              Just GYUtxoRpcRetryConfig{urrcExponent, urrcDelayLoSec, urrcDelayHiSec, urrcDelayCapSec, urrcTimeoutSec, urrcKeepAlivePingIntervalSec, urrcIdleTimeoutSec} ->
                 (UtxoRpcApi.defaultUtxoRpcConfig (Text.unpack cpiUtxoRpcHost) cpiUtxoRpcPort cpiUtxoRpcUseTls slotCachingTime)
                   { UtxoRpcApi.utxoRpcReconnectPolicy = cappedIndefiniteBackoff threadDelay urrcExponent (urrcDelayLoSec, urrcDelayHiSec) urrcDelayCapSec
                   , UtxoRpcApi.utxoRpcDefaultTimeout = Just (Timeout Second (TimeoutValue urrcTimeoutSec))
+                  , UtxoRpcApi.utxoRpcHTTP2Settings =
+                      defaultHTTP2Settings
+                        { http2ClientKeepAlivePingInterval = secondsToMicros <$> urrcKeepAlivePingIntervalSec
+                        , http2ClientIdleTimeout = secondsToMicros <$> urrcIdleTimeoutSec
+                        }
                   }
         provider <- UtxoRpcApi.mkUtxoRpc urconf
         eraHistory <- utxoRpcNetworkEraHistory cfgNetworkId
