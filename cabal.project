@@ -14,7 +14,9 @@ packages: plutus/atlas-onchain-common
           https://hackage.haskell.org/package/utxorpc-0.0.19.2/utxorpc-0.0.19.2.tar.gz
 
 -- Patched grapesy fork: idle-timeout + keepalive-ping fields, needed by
--- GYConfig.hs's HTTP2Settings wiring. Not upstreamed yet.
+-- GYConfig.hs's HTTP2Settings wiring. Upstream PR:
+-- https://github.com/well-typed/grapesy/pull/380 (open, not merged) --
+-- pinned to the fork branch until it lands.
 --
 -- Only applies when this cabal.project is used directly; downstream
 -- consumers must pin the same fork themselves (their cabal.project is
@@ -22,7 +24,7 @@ packages: plutus/atlas-onchain-common
 source-repository-package
   type: git
   location: https://github.com/adrian1-dot/grapesy.git
-  tag: dbb4b91a454b88df343983c16214d387bf79059b
+  tag: f249096fd7a985d38440e2f3b603f7a45a93a5ca
   subdir: grapesy
 
 tests: true

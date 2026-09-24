@@ -161,11 +161,20 @@ utxoRpcGetSlotOfCurrentBlock timeout uc = do
 -- raw immutable value. grapesy's own reconnect machinery
 -- ('connReconnectPolicy'\/'stayConnected') only ever re-triggers when a
 -- /new/ connection attempt fails -- it never notices an established
--- connection dying silently between calls (no keepalive/ping exists in
--- grapesy as of 1.2.0; see
--- <https://github.com/well-typed/grapesy/issues/228>). When that happens,
--- the wedged call fails fast via 'callTimeout'
--- ('GrpcException' with 'GrpcDeadlineExceeded'), and
+-- connection dying silently between calls. Stock grapesy 1.2.0 has no
+-- keepalive/ping to catch this (see
+-- <https://github.com/well-typed/grapesy/issues/228>); our patched fork
+-- adds one ('GYUtxoRpcRetryConfig''s @urrcKeepAlivePingIntervalSec@\/
+-- @urrcIdleTimeoutSec@, wired in 'GeniusYield.GYConfig'; upstream PR
+-- <https://github.com/well-typed/grapesy/pull/380 #380>, not merged --
+-- fork branch pinned in @cabal.project@), but as of this writing both
+-- fields default to 'Nothing' downstream (grapesy default), and whether a
+-- configured idle-timeout close now also flips 'ucConnected' automatically
+-- (via 'stayConnected'\/'trackConnectivity' below) rather than only being
+-- caught reactively is unverified -- not yet exercised against a live
+-- silent-death repro. Until that's confirmed, treat the wedged-connection
+-- case as still relying on 'callTimeout' below: the wedged call fails fast
+-- via 'callTimeout' ('GrpcException' with 'GrpcDeadlineExceeded'), and
 -- 'utxoRpcCallWithReconnect' below explicitly closes the dead connection
 -- and opens a fresh one, so the /next/ call gets a working connection
 -- instead of hanging forever on the same dead one. The failing call itself
@@ -260,8 +269,22 @@ utxoRpcCallWithReconnect uc action = do
 -- Reuses 'ucConnParams' as-is, so the connectivity tracking wired into it
 -- by 'withUtxoRpcConnection' carries over to the rebuilt connection without
 -- needing to be re-applied here.
+--
+-- Flips 'ucConnected' to 'False' /before/ starting the rebuild -- not just
+-- as a side effect of the new connection's own eventual failure. Without
+-- this, the flag stays stale-'True' for the entire time the new
+-- 'openConnection' attempt takes to resolve (which 'openConnection' does
+-- not block on -- it forks 'stayConnected' and returns immediately), so
+-- any caller landing in that window falls through 'utxoRpcCallWithReconnect'
+-- straight into the unbounded 'getConnectionToServer' wait the flag exists
+-- to prevent -- the exact failure mode 'trackConnectivity' closes for the
+-- /natural/ disconnect path, reopened here for the /manual/ rebuild path.
+-- 'connOnConnection' (wired into 'ucConnParams' the same way) flips it back
+-- 'True' once the new connection is actually ready, so this stays
+-- symmetric with that path.
 rebuildUtxoRpcConn :: UtxoRpcConn -> IO ()
 rebuildUtxoRpcConn uc = do
+  atomically $ STM.writeTVar (ucConnected uc) False
   old <- takeMVar (ucConnVar uc)
   closeConnection old
   new <- openConnection (ucConnParams uc) (ucServer uc)
